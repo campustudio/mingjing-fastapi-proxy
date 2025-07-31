@@ -4,6 +4,11 @@
   "routes": [
     {
       "src": "/v1/chat/completions",
+      "methods": ["POST"],
+      "dest": "main.py"
+    },
+    {
+      "src": "/(.*)",
       "dest": "main.py"
     }
   ]
