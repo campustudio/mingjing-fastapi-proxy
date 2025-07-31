@@ -5,10 +5,15 @@ import httpx
 import os
 import asyncio
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()  # This loads environment variables from .env
 
 app = FastAPI()
+
+# 设置日志等级和格式
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # 允许跨域（部署后前端才能访问）
 app.add_middleware(
@@ -56,6 +61,10 @@ async def proxy_openai_chat(request: Request):
         # 普通响应
         async with httpx.AsyncClient(timeout=60.0) as client:
             res = await client.post(UPSTREAM_URL, headers=headers, json=payload)
+
+            logger.info("🟢 OpenAI 返回状态码: %s", res.status_code)
+            logger.info("🟢 OpenAI 返回内容: %s", res.text)
+
             return Response(
                 content=res.text,
                 status_code=res.status_code,
@@ -63,4 +72,5 @@ async def proxy_openai_chat(request: Request):
             )
 
     except Exception as e:
+        logger.error("🔴 错误发生: %s", str(e))
         return JSONResponse(status_code=500, content={"error": str(e)})
