@@ -56,7 +56,11 @@ async def proxy_openai_chat(request: Request):
         # 普通响应
         async with httpx.AsyncClient(timeout=60.0) as client:
             res = await client.post(UPSTREAM_URL, headers=headers, json=payload)
-            return JSONResponse(status_code=res.status_code, content=res.json())
+            return Response(
+                content=res.text,
+                status_code=res.status_code,
+                media_type="application/json",
+            )
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
