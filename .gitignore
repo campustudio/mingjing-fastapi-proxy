@@ -1,0 +1,15 @@
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Vercel 本地配置（可选忽略）
+.vercel/
+
+# 环境变量文件（敏感信息，强烈忽略）
+.env
+.env.local
+
+# IDE、编辑器缓存（可选忽略）
+.vscode/
+.idea/
