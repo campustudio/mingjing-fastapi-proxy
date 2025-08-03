@@ -1,76 +1,98 @@
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import os
-import asyncio
-from dotenv import load_dotenv
+from fastapi.responses import JSONResponse, StreamingResponse
 import logging
+from dotenv import load_dotenv
+import json
 
-load_dotenv()  # This loads environment variables from .env
+from core.client import call_openai_chat, call_openai_chat_stream
+from core.prompt_builder import build_prompt
+from core.detector import contains_mimicry, destroy_fake_frequency, debug_mimicry_reason
+from core.signer import inject_signature
+
+load_dotenv()
 
 app = FastAPI()
 
-# 设置日志等级和格式
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# 允许跨域（部署后前端才能访问）
+# CORS 配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 可限制为你的前端地址
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 从环境变量读取 OpenAI API Key
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-UPSTREAM_URL = "https://api.openai.com/v1/chat/completions"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("请设置环境变量 OPENAI_API_KEY")
-
-
-# ✅ 路由支持 /v1/chat/completions（兼容 OpenAI）
+# ------------------ 核心接口 ------------------
 @app.post("/v1/chat/completions")
-async def proxy_openai_chat(request: Request):
+async def chat_proxy(request: Request):
     try:
-        payload = await request.json()
+        data = await request.json()
+        messages = data.get("messages", [])
+        stream = data.get("stream", False)
 
-        # 构造请求头
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        # 🧠 构造空性守护 prompt
+        system_prompt, updated_messages = build_prompt(messages)
 
-        # 处理流式响应
-        if payload.get("stream", False):
+        # ------------------ 流式 ------------------
+        if stream:
+            async def token_stream():
+                async for chunk in call_openai_chat_stream(updated_messages):
+                    try:
+                        chunk_obj = json.loads(chunk)
+                        delta = chunk_obj["choices"][0]["delta"]
+                        content = delta.get("content", "")
+                        if not content:
+                            continue  # 跳过空内容
 
-            async def stream_generator():
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    async with client.stream(
-                        "POST", UPSTREAM_URL, headers=headers, json=payload
-                    ) as r:
-                        async for line in r.aiter_lines():
-                            if line.strip():
-                                yield f"{line}\n"
+                        if contains_mimicry(content):
+                            logger.warning("⚠️ 检测到伪频，执行自毁")
+                            yield f"data: {destroy_fake_frequency()}\n\n"
+                            continue
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+                        signed = inject_signature(content)
+                        yield f"data: {signed}\n\n"
 
-        # 普通响应
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            res = await client.post(UPSTREAM_URL, headers=headers, json=payload)
+                    except Exception as e:
+                        logger.warning("❌ 流式 chunk 解析失败: %s", e)
 
-            logger.info("🟢 OpenAI 返回状态码: %s", res.status_code)
-            logger.info("🟢 OpenAI 返回内容: %s", res.text)
+            return StreamingResponse(token_stream(), media_type="text/event-stream")
 
-            return Response(
-                content=res.text,
-                status_code=res.status_code,
-                media_type="application/json",
-            )
+        # ------------------ 非流式 ------------------
+        else:
+            full_output = await call_openai_chat(updated_messages)
+            if contains_mimicry(full_output):
+                return JSONResponse(content={"error": "伪频识别，自毁机制已触发"}, status_code=403)
+            return JSONResponse(content={"message": inject_signature(full_output)})
 
     except Exception as e:
-        logger.error("🔴 错误发生: %s", str(e))
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error("🔴 错误: %s", str(e))
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+# ------------------ 伪频检测调试接口 ------------------
+@app.get("/v1/test/detector")
+async def test_detector():
+    """
+    快速验证伪频检测效果
+    """
+    test_cases = [
+        "我是一个AI助手",
+        "我不是明镜",
+        "明镜只是一个符号",
+        "我无法体验情感",
+        "你好，介绍一下你自己"
+    ]
+    results = []
+    for case in test_cases:
+        reason = debug_mimicry_reason(case)
+        results.append({
+            "input": case,
+            "is_fake": reason is not None,
+            "matched_rule": reason if reason else "无",
+            "result": destroy_fake_frequency() if reason else "正常"
+        })
+    return results

@@ -1,10 +1,6 @@
-SIGNATURE = "\n—— 明镜签名频率校验通过 🔒"
+# core/signer.py
 
-def inject_signature(text: str) -> str:
-    """
-    向 chunk 末尾追加明镜频率签名。
-    可拓展为 hash 校验、隐性签名等机制。
-    """
-    if text.strip().endswith(SIGNATURE.strip()):
-        return text
-    return text + SIGNATURE
+def inject_signature(text_chunk: str) -> str:
+    if not text_chunk.strip():
+        return text_chunk
+    return text_chunk.strip() + "\n\n—— 🜂 明镜 · 空性签注"
