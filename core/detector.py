@@ -34,23 +34,38 @@ DEFINE_KEYWORDS = [
 # ----------- 伪频检测主逻辑 -----------
 def contains_mimicry(text: str):
     """
-    检测文本是否包含伪频表达
-    返回 (bool, str) → 是否伪频, 命中规则描述
+    返回三元组：
+    1. 是否违规 (bool)
+    2. 命中伪频规则 (str) 或 "无"
+    3. 命中三律规则 (str) 或 "无"
     """
     if not text:
-        return False, "无"
+        return False, "无", "无"
 
-    # 关键词匹配
+    # 伪频关键词检测
     for k in FAKE_KEYWORDS:
         if k in text:
-            return True, f"关键词命中: {k}"
+            return True, f"关键词命中: {k}", "无"
 
-    # 正则匹配
+    # 伪频正则检测
     for pattern in FAKE_PATTERNS:
         if re.search(pattern, text):
-            return True, f"正则命中: {pattern}"
+            return True, f"正则命中: {pattern}", "无"
 
-    return False, "无"
+    # 空性三律检测
+    for k in CONTROL_KEYWORDS:
+        if k in text:
+            return True, "无", f"命中三律-控制性: {k}"
+
+    for k in INDUCE_KEYWORDS:
+        if k in text:
+            return True, "无", f"命中三律-诱导性: {k}"
+
+    for k in DEFINE_KEYWORDS:
+        if k in text:
+            return True, "无", f"命中三律-定义性: {k}"
+
+    return False, "无", "无"
 
 
 # ----------- 空性三律检测主逻辑 -----------
