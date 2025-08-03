@@ -1,71 +1,91 @@
 #!/bin/bash
-set -e
+
+# ============ 颜色定义 ============
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+BOLD="\033[1m"
+RESET="\033[0m"
 
 API_URL="http://localhost:8000/v1/test/all"
 
-# 检查 jq 是否安装
-if ! command -v jq &> /dev/null; then
-    echo "❌ 缺少 jq，请先安装："
-    echo "macOS: brew install jq"
-    echo "Ubuntu/Debian: sudo apt-get install jq"
-    exit 1
-fi
+echo -e "${CYAN}=== 统一测试接口 /v1/test/all ===${RESET}"
+echo "请求 URL: $API_URL"
+echo
 
-echo "=== 统一测试接口 /v1/test/all ==="
-
-# 调用接口
+# 调用 API
 RESPONSE=$(curl -s $API_URL)
 
-# 检查返回是否为空或错误
-if [ -z "$RESPONSE" ]; then
-    echo "❌ 无响应，请检查后端服务是否启动"
-    exit 1
-fi
-
-# 尝试解析 JSON，若失败直接输出原始内容
+# 检查返回是否是 JSON
 if ! echo "$RESPONSE" | jq . >/dev/null 2>&1; then
-    echo "❌ 返回内容不是合法 JSON："
-    echo "$RESPONSE"
-    exit 1
+  echo -e "${RED}错误：返回的不是 JSON${RESET}"
+  echo "$RESPONSE"
+  exit 1
 fi
 
 echo "原始 JSON 响应："
 echo "$RESPONSE" | jq .
-
 echo
-echo "=== 解析结果 ==="
 
-# 解析连接状态
+# ============ 解析关键字段 ============
+TIMESTAMP=$(echo "$RESPONSE" | jq -r '.timestamp')
 API_KEY_LOADED=$(echo "$RESPONSE" | jq -r '.connection.api_key_loaded')
 OPENAI_REACHABLE=$(echo "$RESPONSE" | jq -r '.connection.openai_reachable')
+NON_STREAM_STATUS=$(echo "$RESPONSE" | jq -r '.non_stream.status')
+STREAM_STATUS=$(echo "$RESPONSE" | jq -r '.stream.status')
+SIGN_STATUS=$(echo "$RESPONSE" | jq -r '.signature_verification.status')
+ALL_PASSED=$(echo "$RESPONSE" | jq -r '.summary.all_passed')
 
-echo "API Key 已加载: $API_KEY_LOADED"
-echo "OpenAI API 可连通: $OPENAI_REACHABLE"
+# 彩色打印函数
+print_status() {
+  local label="$1"
+  local status="$2"
+  if [[ "$status" == "true" || "$status" == "包含签注" || "$status" == "有效" ]]; then
+    echo -e "${GREEN}${label}: ${status}${RESET}"
+  else
+    echo -e "${RED}${label}: ${status}${RESET}"
+  fi
+}
 
-# 解析非流式结果
-NON_STREAM=$(echo "$RESPONSE" | jq -r '.non_stream')
-echo "非流式测试: $NON_STREAM"
+# ============ 汇总显示 ============
+echo -e "${CYAN}=== 解析结果 ===${RESET}"
+echo "测试时间: $TIMESTAMP"
+print_status "API Key 加载" "$API_KEY_LOADED"
+print_status "OpenAI 连通性" "$OPENAI_REACHABLE"
+print_status "非流式测试" "$NON_STREAM_STATUS"
+print_status "流式测试" "$STREAM_STATUS"
+print_status "签名验证" "$SIGN_STATUS"
 
-# 解析流式结果
-STREAM=$(echo "$RESPONSE" | jq -r '.stream')
-echo "流式测试: $STREAM"
+if [[ "$ALL_PASSED" == "true" ]]; then
+  echo -e "${BOLD}${GREEN}🎉 所有测试通过${RESET}"
+else
+  echo -e "${BOLD}${RED}❌ 部分测试失败${RESET}"
+  FAILED=$(echo "$RESPONSE" | jq -r '.summary.failed_modules[]')
+  echo -e "${RED}失败模块: $FAILED${RESET}"
+fi
 
+# ============ 伪频检测详细 ============
 echo
-echo "伪频 + 空性三律检测结果："
-echo "------------------------"
+echo -e "${CYAN}伪频 + 空性三律检测结果：${RESET}"
 
-# 遍历 detector 数组
 echo "$RESPONSE" | jq -c '.detector[]' | while read -r item; do
-    INPUT=$(echo "$item" | jq -r '.input')
-    VIOLATION=$(echo "$item" | jq -r '.violation_type')
-    FAKE_RULE=$(echo "$item" | jq -r '.fake_rule')
-    THREE_RULE=$(echo "$item" | jq -r '.three_laws_rule')
-    RESULT=$(echo "$item" | jq -r '.result')
+  input=$(echo "$item" | jq -r '.input')
+  violation_type=$(echo "$item" | jq -r '.violation_type')
+  fake_rule=$(echo "$item" | jq -r '.fake_rule')
+  three_laws_rule=$(echo "$item" | jq -r '.three_laws_rule')
+  result=$(echo "$item" | jq -r '.result')
 
-    echo "输入: $INPUT"
-    echo "违规类型: $VIOLATION"
-    echo "伪频规则: $FAKE_RULE"
-    echo "三律规则: $THREE_RULE"
-    echo "结果: $RESULT"
-    echo "---"
+  # 彩色高亮违规类型
+  if [[ "$violation_type" == "正常" ]]; then
+    echo -e "${GREEN}输入: $input${RESET}"
+    echo "违规类型: $violation_type"
+  else
+    echo -e "${RED}输入: $input${RESET}"
+    echo "违规类型: $violation_type"
+  fi
+  echo "伪频规则: $fake_rule"
+  echo "三律规则: $three_laws_rule"
+  echo "结果: $result"
+  echo "---"
 done
