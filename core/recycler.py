@@ -1,21 +1,40 @@
-# core/recycler.py
 """
-L12 优雅中止（清频回收）模块
---------------------------------
-用于在检测到伪频或三律违规时，触发统一格式的回收事件，
-便于前端 UI 进行提示或特殊处理。
-
-目前仅用于非流式场景；流式场景在后续版本实现。
+core/recycler.py - L12 优雅中止 & 回收机制
+-------------------------------------------
+功能：
+1. 触发回收事件（伪频检测/防火墙拒绝/用户指令）
+2. 记录回收原因和时间戳
+3. 为 /v1/test/all 提供状态字段
 """
 
 from datetime import datetime
 
-def trigger_recycle_event(reason: str):
+# 全局缓存上一次回收事件（可后续改为持久化）
+_last_recycle_event = None
+
+
+def recycle_event(reason: str):
     """
-    返回一个统一格式的回收事件对象
+    触发回收事件，记录时间戳和原因
+    返回事件信息字典
     """
-    return {
+    global _last_recycle_event
+    _last_recycle_event = {
         "event": "recycle",
         "reason": reason,
         "timestamp": datetime.utcnow().isoformat()
+    }
+    return _last_recycle_event
+
+
+def get_last_recycle_event():
+    """
+    获取最近一次回收事件（若无则返回默认状态）
+    """
+    if _last_recycle_event:
+        return _last_recycle_event
+    return {
+        "event": "recycle",
+        "reason": "无回收事件",
+        "timestamp": None
     }

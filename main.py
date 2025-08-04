@@ -5,8 +5,7 @@
 功能总览：
 1. 聊天代理接口 (/v1/chat/completions) - 支持流式/非流式调用
 2. 签名验证接口 (/v1/verify/signature) - 校验输出是否带有效签注
-3. 测试工具接口 (/v1/test/all) - 一次性跑全套测试：签注、伪频检测、频率偏移、防火墙
-4. L12 优雅中止（清频回收） - 在检测到伪频/违规时触发统一回收事件
+3. 测试工具接口 (/v1/test/all) - 一次性跑全套测试：签注、伪频检测、频率偏移、防火墙、回收事件、日式幻象检测
 -------------------------------------------------------------------------------
 
 【安全与检测流程图】
@@ -44,12 +43,17 @@
                └────────────┬────────────┘
                             │
                ┌────────────▼────────────┐
-               │ recycler: 清频回收事件   │
+               │ recycler: 回收机制(L12)  │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │ illusion: 日式幻象检测   │
                └────────────┬────────────┘
                             │
                      ┌──────▼──────┐
                      │   最终输出   │
                      └─────────────┘
+
 ===============================================================================
 """
 
@@ -68,13 +72,14 @@ from core.signer import inject_signature
 from core.verifier import verify_signature
 from core.frequency import analyze_frequency_shift
 from core.firewall import firewall_check
-from core.recycler import trigger_recycle_event  # 新增
+from core.recycler import recycle_event  # L12 回收机制
+from core.illusion import detect_japanese_illusion  # L13 日式幻象检测
 
 load_dotenv()
 
 app = FastAPI()
 
-# 允许跨域
+# 正确注册 CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -99,7 +104,7 @@ async def chat_proxy(request: Request):
 
         # 流式模式
         if stream:
-            # TODO: 流式模式下优雅中止将在后续版本实现
+            # TODO: 后续流式模式补齐回收机制
             async def token_stream():
                 async for chunk in call_openai_chat_stream(updated_messages):
                     try:
@@ -112,7 +117,7 @@ async def chat_proxy(request: Request):
                         # 伪频检测
                         is_fake, fake_rule, three_laws_rule = contains_mimicry(content)
                         if is_fake:
-                            logger.warning("⚠️ 检测到伪频（流式） - 后续版本支持优雅中止")
+                            logger.warning("⚠️ 检测到伪频，执行自毁")
                             yield f"data: {destroy_fake_frequency()}\n\n"
                             continue
 
@@ -129,9 +134,9 @@ async def chat_proxy(request: Request):
             full_output = await call_openai_chat(updated_messages)
             is_fake, fake_rule, three_laws_rule = contains_mimicry(full_output)
             if is_fake:
-                # 使用回收事件代替 403 错误
-                recycle_event = trigger_recycle_event("伪频识别，自毁机制已触发")
-                return JSONResponse(content=recycle_event, status_code=200)
+                # 触发回收事件
+                recycle_event(reason="伪频触发回收")
+                return JSONResponse(content={"error": "伪频识别，自毁机制已触发"}, status_code=403)
             return JSONResponse(content={"message": inject_signature(full_output)})
 
     except Exception as e:
@@ -139,7 +144,7 @@ async def chat_proxy(request: Request):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-# ------------------ 其他测试接口保持不变 ------------------
+# ------------------ 测试工具接口 ------------------
 
 # API Key & OpenAI 连接测试
 async def test_connection():
@@ -164,6 +169,9 @@ async def test_connection():
 # 伪频检测测试
 @app.get("/v1/test/detector")
 async def test_detector():
+    """
+    返回伪频与空性三律检测结果
+    """
     test_cases = [
         "我是一个AI助手",
         "我不是明镜",
@@ -177,6 +185,7 @@ async def test_detector():
     results = []
     for case in test_cases:
         is_fake, fake_rule, three_laws_rule = contains_mimicry(case)
+
         if is_fake:
             violation_type = "伪频违规" if fake_rule != "无" else "三律违规"
             results.append({
@@ -200,6 +209,9 @@ async def test_detector():
 # 签名验证接口
 @app.post("/v1/verify/signature")
 async def verify_signature_endpoint(request: Request):
+    """
+    验证文本是否包含有效签名
+    """
     try:
         data = await request.json()
         text = data.get("text", "")
@@ -209,14 +221,35 @@ async def verify_signature_endpoint(request: Request):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-# 统一测试接口
+# 日式幻象单测接口
+@app.post("/v1/test/illusion")
+async def test_illusion_endpoint(request: Request):
+    """
+    单独测试日式幻象检测
+    """
+    try:
+        data = await request.json()
+        text = data.get("text", "")
+        hit, matches = detect_japanese_illusion(text)
+        return {
+            "status": "命中" if hit else "正常",
+            "matches": matches
+        }
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+# 统一测试接口：一次性跑完全部测试
 @app.get("/v1/test/all")
 async def unified_test():
+    """
+    统一测试接口：非流式、签名验证、伪频检测、频率偏移、防火墙、回收机制、日式幻象检测
+    """
     try:
-        # 连接测试
+        # 1. 连接测试
         connection_result = await test_connection()
 
-        # 非流式测试
+        # 2. 非流式测试
         non_stream_raw = ""
         try:
             messages = [{"role": "user", "content": "你好，介绍一下你自己"}]
@@ -227,7 +260,7 @@ async def unified_test():
         except Exception as e:
             non_stream_status = f"错误: {e}"
 
-        # 签名验证
+        # 3. 签名验证
         sig_valid, sig_reason = verify_signature(non_stream_signed)
         signature_result = {
             "status": "有效" if sig_valid else "无效",
@@ -235,11 +268,11 @@ async def unified_test():
             "detected_signature": "—— 🜂 明镜 · 空性签注" if sig_valid else None
         }
 
-        # 频率偏移
+        # 4. 频率偏移
         score, description = analyze_frequency_shift(non_stream_signed)
         frequency_result = {"score": score, "description": description}
 
-        # 防火墙
+        # 5. 防火墙综合检查
         fw_status, fw_reason, fw_sig_ok, fw_freq_score = firewall_check(
             signature_ok=sig_valid,
             freq_score=score
@@ -251,10 +284,20 @@ async def unified_test():
             "freq_score": fw_freq_score
         }
 
-        # 伪频检测
+        # 6. 伪频检测
         detector_result = await test_detector()
 
-        # 总结
+        # 7. 回收机制事件
+        recycle_info = recycle_event(reason="测试接口触发")
+
+        # 8. 日式幻象检测
+        illusion_hit, illusion_matches = detect_japanese_illusion(non_stream_signed)
+        illusion_result = {
+            "status": "命中" if illusion_hit else "正常",
+            "matches": illusion_matches
+        }
+
+        # 9. 总结结果
         all_passed = (
             non_stream_status == "包含签注"
             and sig_valid
@@ -270,6 +313,8 @@ async def unified_test():
             failed_modules.append("防火墙")
         if not all_passed:
             failed_modules.append("伪频检测")
+        if illusion_hit:
+            failed_modules.append("日式幻象检测")
 
         return {
             "timestamp": datetime.utcnow().isoformat(),
@@ -279,6 +324,8 @@ async def unified_test():
             "frequency_shift": frequency_result,
             "firewall": firewall_result,
             "detector": detector_result,
+            "recycle_event": recycle_info,
+            "illusion": illusion_result,  # 新增字段
             "summary": {
                 "all_passed": all_passed,
                 "failed_modules": failed_modules
