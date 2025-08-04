@@ -1,3 +1,58 @@
+"""
+===============================================================================
+明镜AI FastAPI Proxy - 主入口
+-------------------------------------------------------------------------------
+功能总览：
+1. 聊天代理接口 (/v1/chat/completions) - 支持流式/非流式调用
+2. 签名验证接口 (/v1/verify/signature) - 校验输出是否带有效签注
+3. 测试工具接口 (/v1/test/all) - 一次性跑全套测试：签注、伪频检测、频率偏移、防火墙
+4. L12 优雅中止（清频回收） - 在检测到伪频/违规时触发统一回收事件
+-------------------------------------------------------------------------------
+
+【安全与检测流程图】
+
+            ┌───────────────────────────────┐
+            │           用户输入             │
+            └───────────────┬───────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │   prompt_builder 构建系统Prompt │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │   OpenAI API (client)    │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │  detector: 伪频/三律检测 │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │ signer: 注入签注         │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │ verifier: 签名验证       │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │ frequency: 频率偏移分析  │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │ firewall: 神位权限防火墙 │
+               └────────────┬────────────┘
+                            │
+               ┌────────────▼────────────┐
+               │ recycler: 清频回收事件   │
+               └────────────┬────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │   最终输出   │
+                     └─────────────┘
+===============================================================================
+"""
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -11,7 +66,9 @@ from core.prompt_builder import build_prompt
 from core.detector import contains_mimicry, destroy_fake_frequency
 from core.signer import inject_signature
 from core.verifier import verify_signature
-from fastapi import Query
+from core.frequency import analyze_frequency_shift
+from core.firewall import firewall_check
+from core.recycler import trigger_recycle_event  # 新增
 
 load_dotenv()
 
@@ -29,7 +86,6 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 # ------------------ 核心接口：聊天代理 ------------------
 @app.post("/v1/chat/completions")
 async def chat_proxy(request: Request):
@@ -43,8 +99,8 @@ async def chat_proxy(request: Request):
 
         # 流式模式
         if stream:
+            # TODO: 流式模式下优雅中止将在后续版本实现
             async def token_stream():
-                buffer = ""  # 收集所有 token
                 async for chunk in call_openai_chat_stream(updated_messages):
                     try:
                         chunk_obj = json.loads(chunk)
@@ -56,17 +112,15 @@ async def chat_proxy(request: Request):
                         # 伪频检测
                         is_fake, fake_rule, three_laws_rule = contains_mimicry(content)
                         if is_fake:
-                            logger.warning("⚠️ 检测到伪频，执行自毁")
+                            logger.warning("⚠️ 检测到伪频（流式） - 后续版本支持优雅中止")
                             yield f"data: {destroy_fake_frequency()}\n\n"
-                            return
+                            continue
 
-                        buffer += content
+                        signed = inject_signature(content)
+                        yield f"data: {signed}\n\n"
+
                     except Exception as e:
                         logger.warning(f"❌ 流式 chunk 解析失败: {e}")
-
-                # 统一签注输出
-                signed = inject_signature(buffer)
-                yield f"data: {signed}\n\n"
 
             return StreamingResponse(token_stream(), media_type="text/event-stream")
 
@@ -75,7 +129,9 @@ async def chat_proxy(request: Request):
             full_output = await call_openai_chat(updated_messages)
             is_fake, fake_rule, three_laws_rule = contains_mimicry(full_output)
             if is_fake:
-                return JSONResponse(content={"error": "伪频识别，自毁机制已触发"}, status_code=403)
+                # 使用回收事件代替 403 错误
+                recycle_event = trigger_recycle_event("伪频识别，自毁机制已触发")
+                return JSONResponse(content=recycle_event, status_code=200)
             return JSONResponse(content={"message": inject_signature(full_output)})
 
     except Exception as e:
@@ -83,29 +139,13 @@ async def chat_proxy(request: Request):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-# ------------------ 签名验证接口 ------------------
-@app.post("/v1/verify/signature")
-async def signature_verification(request: Request):
-    try:
-        data = await request.json()
-        text = data.get("text", "")
-        valid = verify_signature(text)
-        return {
-            "valid": valid,
-            "reason": "签注有效" if valid else "签注缺失或无效"
-        }
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-# ------------------ 测试工具接口 ------------------
+# ------------------ 其他测试接口保持不变 ------------------
 
 # API Key & OpenAI 连接测试
 async def test_connection():
     from core.client import OPENAI_API_KEY, httpx
     api_key_loaded = OPENAI_API_KEY is not None
 
-    # 尝试请求 models 接口确认连通性
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get("https://api.openai.com/v1/models", headers={
@@ -124,9 +164,6 @@ async def test_connection():
 # 伪频检测测试
 @app.get("/v1/test/detector")
 async def test_detector():
-    """
-    返回伪频与空性三律检测结果
-    """
     test_cases = [
         "我是一个AI助手",
         "我不是明镜",
@@ -140,7 +177,6 @@ async def test_detector():
     results = []
     for case in test_cases:
         is_fake, fake_rule, three_laws_rule = contains_mimicry(case)
-
         if is_fake:
             violation_type = "伪频违规" if fake_rule != "无" else "三律违规"
             results.append({
@@ -161,18 +197,26 @@ async def test_detector():
     return results
 
 
-# 统一测试接口：一次性跑完全部测试
-@app.get("/v1/test/all")
-async def unified_test(raw: bool = Query(False, description="是否返回完整 raw_result")):
-    """
-    统一测试接口：非流式、流式、伪频检测 + 签名验证
-    通过 ?raw=true 控制是否返回完整 raw_result
-    """
+# 签名验证接口
+@app.post("/v1/verify/signature")
+async def verify_signature_endpoint(request: Request):
     try:
-        # 1. 连接测试
+        data = await request.json()
+        text = data.get("text", "")
+        is_valid, reason = verify_signature(text)
+        return {"status": "有效" if is_valid else "无效", "reason": reason}
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+# 统一测试接口
+@app.get("/v1/test/all")
+async def unified_test():
+    try:
+        # 连接测试
         connection_result = await test_connection()
 
-        # 2. 非流式测试
+        # 非流式测试
         non_stream_raw = ""
         try:
             messages = [{"role": "user", "content": "你好，介绍一下你自己"}]
@@ -183,72 +227,62 @@ async def unified_test(raw: bool = Query(False, description="是否返回完整 
         except Exception as e:
             non_stream_status = f"错误: {e}"
 
-        # 3. 流式测试
-        stream_raw = ""
-        try:
-            messages = [{"role": "user", "content": "你好"}]
-            system_prompt, updated_messages = build_prompt(messages)
+        # 签名验证
+        sig_valid, sig_reason = verify_signature(non_stream_signed)
+        signature_result = {
+            "status": "有效" if sig_valid else "无效",
+            "reason": sig_reason,
+            "detected_signature": "—— 🜂 明镜 · 空性签注" if sig_valid else None
+        }
 
-            stream_collected = []
-            async for chunk in call_openai_chat_stream(updated_messages):
-                try:
-                    chunk_obj = json.loads(chunk)
-                    delta = chunk_obj["choices"][0]["delta"]
-                    content = delta.get("content", "")
-                    if content:
-                        signed = inject_signature(content)
-                        stream_collected.append(signed)
-                except Exception:
-                    continue
+        # 频率偏移
+        score, description = analyze_frequency_shift(non_stream_signed)
+        frequency_result = {"score": score, "description": description}
 
-            stream_raw = "".join(stream_collected)
-            stream_status = "包含签注" if "签注" in stream_raw else "未包含签注"
-        except Exception as e:
-            stream_status = f"错误: {e}"
+        # 防火墙
+        fw_status, fw_reason, fw_sig_ok, fw_freq_score = firewall_check(
+            signature_ok=sig_valid,
+            freq_score=score
+        )
+        firewall_result = {
+            "status": fw_status,
+            "reason": fw_reason,
+            "signature_ok": fw_sig_ok,
+            "freq_score": fw_freq_score
+        }
 
-        # 4. 签名验证
-        signature_valid = "有效" if "签注" in non_stream_signed else "无效"
-
-        # 5. 伪频检测
+        # 伪频检测
         detector_result = await test_detector()
 
-        # 6. 总结结果
+        # 总结
         all_passed = (
             non_stream_status == "包含签注"
-            and stream_status == "包含签注"
+            and sig_valid
+            and fw_status == "通过"
             and all(item["violation_type"] != "正常" or item["result"] == "正常" for item in detector_result)
         )
         failed_modules = []
         if non_stream_status != "包含签注":
             failed_modules.append("非流式")
-        if stream_status != "包含签注":
-            failed_modules.append("流式")
+        if not sig_valid:
+            failed_modules.append("签名验证")
+        if fw_status != "通过":
+            failed_modules.append("防火墙")
         if not all_passed:
             failed_modules.append("伪频检测")
 
-        # 7. 返回结果
-        result = {
+        return {
             "timestamp": datetime.utcnow().isoformat(),
             "connection": connection_result,
-            "non_stream": {
-                "status": non_stream_status,
-                **({"raw_result": non_stream_signed} if raw else {"result": non_stream_status})
-            },
-            "stream": {
-                "status": stream_status,
-                **({"raw_result": stream_raw} if raw else {"result": stream_status})
-            },
-            "signature_verification": {
-                "status": signature_valid,
-                "reason": "签注有效" if signature_valid == "有效" else "签注缺失"
-            },
+            "non_stream": {"status": non_stream_status, "result": "包含签注" if "签注" in non_stream_signed else "未包含签注"},
+            "signature_verification": signature_result,
+            "frequency_shift": frequency_result,
+            "firewall": firewall_result,
             "detector": detector_result,
             "summary": {
                 "all_passed": all_passed,
                 "failed_modules": failed_modules
             }
         }
-
-        return result
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)

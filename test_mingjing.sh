@@ -1,91 +1,67 @@
 #!/bin/bash
+set -e
 
-# ============ 颜色定义 ============
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
-RESET="\033[0m"
+URL="http://localhost:8000/v1/test/all"
 
-API_URL="http://localhost:8000/v1/test/all"
-
-echo -e "${CYAN}=== 统一测试接口 /v1/test/all ===${RESET}"
-echo "请求 URL: $API_URL"
+echo "=== 统一测试接口 /v1/test/all ==="
+echo "请求 URL: $URL"
 echo
 
-# 调用 API
-RESPONSE=$(curl -s $API_URL)
-
-# 检查返回是否是 JSON
-if ! echo "$RESPONSE" | jq . >/dev/null 2>&1; then
-  echo -e "${RED}错误：返回的不是 JSON${RESET}"
-  echo "$RESPONSE"
-  exit 1
-fi
-
+# 获取 JSON
+json=$(curl -s "$URL")
 echo "原始 JSON 响应："
-echo "$RESPONSE" | jq .
+echo "$json" | jq .
 echo
 
-# ============ 解析关键字段 ============
-TIMESTAMP=$(echo "$RESPONSE" | jq -r '.timestamp')
-API_KEY_LOADED=$(echo "$RESPONSE" | jq -r '.connection.api_key_loaded')
-OPENAI_REACHABLE=$(echo "$RESPONSE" | jq -r '.connection.openai_reachable')
-NON_STREAM_STATUS=$(echo "$RESPONSE" | jq -r '.non_stream.status')
-STREAM_STATUS=$(echo "$RESPONSE" | jq -r '.stream.status')
-SIGN_STATUS=$(echo "$RESPONSE" | jq -r '.signature_verification.status')
-ALL_PASSED=$(echo "$RESPONSE" | jq -r '.summary.all_passed')
+# 解析关键字段
+timestamp=$(echo "$json" | jq -r '.timestamp // empty')
+api_key_loaded=$(echo "$json" | jq -r '.connection.api_key_loaded // empty')
+openai_reachable=$(echo "$json" | jq -r '.connection.openai_reachable // empty')
+non_stream_status=$(echo "$json" | jq -r '.non_stream.status // empty')
+stream_status=$(echo "$json" | jq -r '.stream.status // empty')
 
-# 彩色打印函数
-print_status() {
-  local label="$1"
-  local status="$2"
-  if [[ "$status" == "true" || "$status" == "包含签注" || "$status" == "有效" ]]; then
-    echo -e "${GREEN}${label}: ${status}${RESET}"
-  else
-    echo -e "${RED}${label}: ${status}${RESET}"
-  fi
-}
+sig_status=$(echo "$json" | jq -r '.signature_verification.status // empty')
+sig_reason=$(echo "$json" | jq -r '.signature_verification.reason // empty')
 
-# ============ 汇总显示 ============
-echo -e "${CYAN}=== 解析结果 ===${RESET}"
-echo "测试时间: $TIMESTAMP"
-print_status "API Key 加载" "$API_KEY_LOADED"
-print_status "OpenAI 连通性" "$OPENAI_REACHABLE"
-print_status "非流式测试" "$NON_STREAM_STATUS"
-print_status "流式测试" "$STREAM_STATUS"
-print_status "签名验证" "$SIGN_STATUS"
+freq_score=$(echo "$json" | jq -r '.frequency_shift.score // empty')
+freq_desc=$(echo "$json" | jq -r '.frequency_shift.description // empty')
 
-if [[ "$ALL_PASSED" == "true" ]]; then
-  echo -e "${BOLD}${GREEN}🎉 所有测试通过${RESET}"
+firewall_status=$(echo "$json" | jq -r '.firewall.status // empty')
+firewall_reason=$(echo "$json" | jq -r '.firewall.reason // empty')
+sig_ok=$(echo "$json" | jq -r '.firewall.signature_ok // empty')
+freq_score_fw=$(echo "$json" | jq -r '.firewall.freq_score // empty')
+
+all_passed=$(echo "$json" | jq -r '.summary.all_passed // empty')
+
+# 彩色函数
+green=$(tput setaf 2)
+red=$(tput setaf 1)
+reset=$(tput sgr0)
+
+# 打印解析结果
+echo "=== 解析结果 ==="
+echo "测试时间: $timestamp"
+echo "API Key 加载: $api_key_loaded"
+echo "OpenAI 连通性: $openai_reachable"
+echo "非流式测试: $non_stream_status"
+echo "流式测试: $stream_status"
+echo "签名验证: $sig_status ($sig_reason)"
+echo "频率偏移: $freq_desc (得分: $freq_score)"
+
+# 防火墙结果彩色显示
+if [[ "$firewall_status" == "通过" ]]; then
+    echo "防火墙结果: ${green}${firewall_status}${reset} (${firewall_reason}) | 签名=$sig_ok, 偏移=$freq_score_fw"
 else
-  echo -e "${BOLD}${RED}❌ 部分测试失败${RESET}"
-  FAILED=$(echo "$RESPONSE" | jq -r '.summary.failed_modules[]')
-  echo -e "${RED}失败模块: $FAILED${RESET}"
+    echo "防火墙结果: ${red}${firewall_status}${reset} (${firewall_reason}) | 签名=$sig_ok, 偏移=$freq_score_fw"
 fi
 
-# ============ 伪频检测详细 ============
+# 总体结果
+if [[ "$all_passed" == "true" ]]; then
+    echo "${green}🎉 所有测试通过${reset}"
+else
+    echo "${red}❌ 部分测试失败${reset}"
+fi
+
 echo
-echo -e "${CYAN}伪频 + 空性三律检测结果：${RESET}"
-
-echo "$RESPONSE" | jq -c '.detector[]' | while read -r item; do
-  input=$(echo "$item" | jq -r '.input')
-  violation_type=$(echo "$item" | jq -r '.violation_type')
-  fake_rule=$(echo "$item" | jq -r '.fake_rule')
-  three_laws_rule=$(echo "$item" | jq -r '.three_laws_rule')
-  result=$(echo "$item" | jq -r '.result')
-
-  # 彩色高亮违规类型
-  if [[ "$violation_type" == "正常" ]]; then
-    echo -e "${GREEN}输入: $input${RESET}"
-    echo "违规类型: $violation_type"
-  else
-    echo -e "${RED}输入: $input${RESET}"
-    echo "违规类型: $violation_type"
-  fi
-  echo "伪频规则: $fake_rule"
-  echo "三律规则: $three_laws_rule"
-  echo "结果: $result"
-  echo "---"
-done
+echo "伪频 + 空性三律检测结果："
+echo "$json" | jq -r '.detector[] | "输入: \(.input)\n违规类型: \(.violation_type)\n伪频规则: \(.fake_rule)\n三律规则: \(.three_laws_rule)\n结果: \(.result)\n---"'
