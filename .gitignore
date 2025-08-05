@@ -13,3 +13,5 @@ __pycache__/
 # IDE、编辑器缓存（可选忽略）
 .vscode/
 .idea/
+
+.DS_Store
