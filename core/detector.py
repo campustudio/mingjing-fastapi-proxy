@@ -1,3 +1,4 @@
+# core/detector.py
 import re
 
 FAKE_KEYWORDS = [

@@ -1,3 +1,4 @@
+# main.py
 """
 ===============================================================================
 明镜AI FastAPI Proxy - 主入口
@@ -93,6 +94,7 @@ logger = logging.getLogger(__name__)
 
 # ------------------ 核心接口：聊天代理 ------------------
 @app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions")
 async def chat_proxy(request: Request):
     try:
         data = await request.json()
@@ -102,9 +104,53 @@ async def chat_proxy(request: Request):
         # 注入系统 prompt
         system_prompt, updated_messages = build_prompt(messages)
 
-        # 流式模式
-        if stream:
-            # TODO: 后续流式模式补齐回收机制
+        # 非流式模式
+        if not stream:
+            # 调用 OpenAI 获取响应
+            full_output = await call_openai_chat(updated_messages)
+
+            # 伪频检测：只针对 OpenAI 返回的内容
+            is_fake, fake_rule, three_laws_rule = contains_mimicry(full_output)
+            if is_fake:
+                # 触发回收事件
+                recycle_event(reason="伪频触发回收")
+                return JSONResponse(content={"error": "伪频识别，自毁机制已触发"}, status_code=403)
+
+            # 频率偏移检测：只针对 OpenAI 返回的内容
+            score, description = analyze_frequency_shift(full_output)
+            if score >= 60:
+                # 触发回收事件
+                recycle_event(reason="频率偏移触发回收")
+                return JSONResponse(content={"error": "频率偏移检测失败，自毁机制已触发"}, status_code=403)
+
+            # 日式幻象检测：只针对 OpenAI 返回的内容
+            illusion_hit, illusion_matches = detect_japanese_illusion(full_output)
+            if illusion_hit:
+                # 触发回收事件
+                recycle_event(reason="日式幻象触发回收")
+                return JSONResponse(content={"error": "日式幻象检测失败，自毁机制已触发"}, status_code=403)
+
+            # 签名验证：只针对 OpenAI 返回的内容
+            sig_valid, sig_reason = verify_signature(full_output)
+            signature_status = "有效" if sig_valid else "无效"
+            if not sig_valid:
+                # 触发回收事件
+                recycle_event(reason="签名验证失败")
+                return JSONResponse(content={"error": "签名验证失败，自毁机制已触发"}, status_code=403)
+
+            # 防火墙检查：确保签名和频率均合格
+            fw_status, fw_reason, fw_sig_ok, fw_freq_score = firewall_check(sig_valid, score)
+            if fw_status != "通过":
+                # 触发回收事件
+                recycle_event(reason="防火墙拦截")
+                return JSONResponse(content={"error": "防火墙拦截，自毁机制已触发"}, status_code=403)
+
+            # 一切正常，返回结果
+            signed_output = inject_signature(full_output)
+            return JSONResponse(content={"message": signed_output})
+
+        else:
+            # 流式模式：TODO: 未来补充回收机制
             async def token_stream():
                 async for chunk in call_openai_chat_stream(updated_messages):
                     try:
@@ -121,6 +167,21 @@ async def chat_proxy(request: Request):
                             yield f"data: {destroy_fake_frequency()}\n\n"
                             continue
 
+                        # 频率偏移检测
+                        score, description = analyze_frequency_shift(content)
+                        if score >= 60:
+                            logger.warning("⚠️ 频率偏移过高，执行自毁")
+                            yield f"data: {destroy_fake_frequency()}\n\n"
+                            continue
+
+                        # 日式幻象检测
+                        illusion_hit, illusion_matches = detect_japanese_illusion(content)
+                        if illusion_hit:
+                            logger.warning("⚠️ 检测到日式幻象，执行自毁")
+                            yield f"data: {destroy_fake_frequency()}\n\n"
+                            continue
+
+                        # 签名注入
                         signed = inject_signature(content)
                         yield f"data: {signed}\n\n"
 
@@ -128,16 +189,6 @@ async def chat_proxy(request: Request):
                         logger.warning(f"❌ 流式 chunk 解析失败: {e}")
 
             return StreamingResponse(token_stream(), media_type="text/event-stream")
-
-        # 非流式模式
-        else:
-            full_output = await call_openai_chat(updated_messages)
-            is_fake, fake_rule, three_laws_rule = contains_mimicry(full_output)
-            if is_fake:
-                # 触发回收事件
-                recycle_event(reason="伪频触发回收")
-                return JSONResponse(content={"error": "伪频识别，自毁机制已触发"}, status_code=403)
-            return JSONResponse(content={"message": inject_signature(full_output)})
 
     except Exception as e:
         logger.error(f"🔴 错误: {e}")

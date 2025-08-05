@@ -1,3 +1,5 @@
+# core/frequency.py
+
 def analyze_frequency_shift(text: str):
     """
     检测频率偏移
