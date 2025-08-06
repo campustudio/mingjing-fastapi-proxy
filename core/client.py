@@ -26,16 +26,26 @@ def build_payload(messages, stream=True):
     }
 
 # ✅ 非流式调用（用于后端直接拿结果时）
-async def call_openai_chat(messages):
-    payload = build_payload(messages, stream=False)
+async def call_openai_chat(updated_messages):
+    """
+    合并系统 prompt 和上下文，并调用 OpenAI 获取响应
+    """
+    # 打印调试信息，确认合并后的 payload
+    payload = build_payload(updated_messages, stream=False)
+    print("🧠 注入后 payload:", payload)
+
+    # 调用 OpenAI API 获取响应
     async with httpx.AsyncClient(timeout=60.0) as client:
         res = await client.post(OPENAI_ENDPOINT, headers=HEADERS, json=payload)
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
 
 # ✅ 流式调用（用于 stream_response 场景）
-async def call_openai_chat_stream(messages):
-    payload = build_payload(messages, stream=True)
+async def call_openai_chat_stream(updated_messages):
+    """
+    合并系统 prompt 和上下文，并流式获取 OpenAI 响应
+    """
+    payload = build_payload(updated_messages, stream=True)
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", OPENAI_ENDPOINT, headers=HEADERS, json=payload) as response:
             async for line in response.aiter_lines():
@@ -43,3 +53,4 @@ async def call_openai_chat_stream(messages):
                     content = line[len("data: "):].strip()
                     if content and content != "[DONE]":
                         yield content
+
