@@ -13,12 +13,16 @@ from core.auth_utils import decode_jwt
 from core.context_manager import context_manager
 
 from core.db_mongo import db, connect
-from core.memory_manager import maybe_update_memory, SUMMARY_UPDATE_EVERY
 
 import asyncio
-import os
 from core.config import CONTEXT_MAX_TURNS
 from core.memory_manager import SUMMARY_UPDATE_EVERY, get_memory, maybe_update_memory
+
+from fastapi import FastAPI
+from core.db_mongo import connect, db
+
+
+
 
 def _trim_to_turn_cap(msgs):
     cap = 2 * CONTEXT_MAX_TURNS
@@ -70,7 +74,7 @@ async def _maybe_schedule_memory(user_id: str):
             q["created_at"] = {"$gt": mem["updated_at"]}
 
         new_user_count = await database["messages"].count_documents(q)
-        threshold = int(os.environ.get("SUMMARY_UPDATE_EVERY", "5"))
+        threshold = SUMMARY_UPDATE_EVERY
 
         # 首次（mem is None）更积极一点
         should_run = (mem is None and new_user_count >= 3) or (new_user_count >= threshold)
@@ -78,14 +82,18 @@ async def _maybe_schedule_memory(user_id: str):
 
         if should_run:
             async def _delayed():
-                # 给插入的消息一点时间落库（add_* 是 create_task 异步写）
-                # await asyncio.sleep(0.05)
+                await asyncio.sleep(0) # 让当前事件循环先 flush 写库
                 await maybe_update_memory(database, user_id)
             asyncio.create_task(_delayed())
     except Exception as e:
         logger.warning(f"schedule memory failed: {e}")
 
 
+
+@app.get("/health")
+async def health():
+    await connect()
+    return {"ok": True, "db": bool(db() is not None)}
 
 # ------------------ 对话上下文存储 ------------------
 # 注意：上下文管理已迁移到 context_manager 模块
@@ -187,7 +195,11 @@ async def chat_proxy(request: Request):
                     
                     await _maybe_schedule_memory(user_id)
 
-            return StreamingResponse(token_stream(), media_type="text/event-stream")
+            return StreamingResponse(token_stream(), media_type="text/event-stream", headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # 某些代理会缓冲
+            })
     except Exception as e:
         logger.error(f"🔴 错误: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)

@@ -1,6 +1,11 @@
 {
   "version": 2,
   "builds": [{ "src": "main.py", "use": "@vercel/python" }],
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.11"
+    }
+  },
   "routes": [
     {
       "src": "/v1/chat/completions",

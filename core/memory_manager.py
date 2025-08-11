@@ -6,6 +6,37 @@ from typing import List, Dict, Any, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Any, Dict
 import asyncio
+from . import client as openai_client
+
+import re
+
+_BULLET_PREFIX = re.compile(r"""^\s*
+    (?:[-*•·●▪‣◦\u2022\u00B7]|—|–|－|·|•)  # -,*,•,·,各种圆点/破折号
+    [\s\u3000]*                            # 半角/全角空格
+""", re.X)
+
+def extract_facts_loose(text: str) -> list[str]:
+    facts = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 1) 宽松识别项目符号
+        if _BULLET_PREFIX.match(line):
+            item = _BULLET_PREFIX.sub("", line).strip(" ・•·-—–－")
+            if item:
+                facts.append(item)
+            continue
+        # 2) 兜底：短句+关键词也收
+        if any(k in line for k in ("喜欢", "正在", "习惯", "目标", "偏好")) and len(line) <= 40:
+            facts.append(line)
+    # 去重保序并截断
+    seen, out = set(), []
+    for f in facts:
+        if f not in seen:
+            seen.add(f); out.append(f)
+    return out[:10]
+
 
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() != "false"
 SUMMARY_UPDATE_EVERY = int(os.getenv("SUMMARY_UPDATE_EVERY", "5"))
@@ -121,6 +152,11 @@ async def maybe_update_memory(db: AsyncIOMotorDatabase, user_id: str):
     if not MEMORY_ENABLED or not user_id:
         return
 
+    # ⬇️ 动态读取阈值（兼容 monkeypatch.setenv）
+    threshold_env = int(os.getenv("SUMMARY_UPDATE_EVERY", str(SUMMARY_UPDATE_EVERY)))
+    # 首次触发阈值：默认最多要 3 条，但如果阈值更小（例如 1），就用更小的
+    first_threshold = max(1, min(3, threshold_env))
+
     lock = _get_user_lock(user_id)
     async with lock:
         mem = await get_memory(db, user_id)
@@ -131,14 +167,13 @@ async def maybe_update_memory(db: AsyncIOMotorDatabase, user_id: str):
             q["created_at"] = {"$gt": last_ts}
         new_user_count = await db["messages"].count_documents(q)
 
-        # ✅ 你现有的“首次/阈值”策略保持不变（方案 C）
+        # ✅ 首次：用 first_threshold；已有记忆：用 threshold_env
         if mem is None:
-            # 首次：放宽触发策略（你现在的逻辑）
             total_user = await db["messages"].count_documents({"user_id": user_id, "role": "user"})
-            if total_user < 3:  # 或你设的首次阈值
+            if total_user < first_threshold:
                 return
         else:
-            if new_user_count < SUMMARY_UPDATE_EVERY:
+            if new_user_count < threshold_env:
                 return
 
         turns = SUMMARY_WINDOW_TURNS
@@ -146,23 +181,18 @@ async def maybe_update_memory(db: AsyncIOMotorDatabase, user_id: str):
         recent: List[Dict[str, Any]] = [doc async for doc in cursor]
         recent.reverse()
 
-        from core.client import call_openai_chat
+        # ✅ 用模块级别导入的 openai_client，保证 monkeypatch 命中
         prompt_msgs = await _build_summary_prompt(mem.get("summary","") if mem else "", recent)
-        summary_text = await call_openai_chat(prompt_msgs)
+        summary_text = await openai_client.call_openai_chat(prompt_msgs)
         if not isinstance(summary_text, str):
             summary_text = str(summary_text)
         if len(summary_text) > SUMMARY_MAXLEN_CHARS:
             summary_text = summary_text[:SUMMARY_MAXLEN_CHARS]
 
-        facts: list[str] = []
-        try:
-            for line in summary_text.splitlines():
-                if line.strip().startswith("- "):
-                    facts.append(line.strip()[2:].strip())
-        except Exception:
-            pass
-
+        # ✅ 用宽松版抽取 facts，适配不规整的输出
+        facts = extract_facts_loose(summary_text)
         await set_memory(db, user_id, summary_text, facts)
+
 
 def build_memory_preamble(mem):
     if not mem:
