@@ -6,14 +6,44 @@ import logging
 from dotenv import load_dotenv
 import json
 
-from core.client import call_openai_chat, call_openai_chat_stream
+from core import client as openai_client
 from core.prompt_builder import build_prompt
 from core.signer import inject_signature
+from core.auth_utils import decode_jwt
 from core.context_manager import context_manager
+
+from core.db_mongo import db, connect
+from core.memory_manager import maybe_update_memory, SUMMARY_UPDATE_EVERY
+
+import asyncio
+import os
+from core.config import CONTEXT_MAX_TURNS
+from core.memory_manager import SUMMARY_UPDATE_EVERY, get_memory, maybe_update_memory
+
+def _trim_to_turn_cap(msgs):
+    cap = 2 * CONTEXT_MAX_TURNS
+    if len(msgs) <= cap:
+        return msgs
+    # 丢掉最早的，保留最后 cap 条（这样即使你前面塞了 persona/preamble 也不会超）
+    return msgs[-cap:]
+
+# 提供可被 monkeypatch 的同名包装（tests 就会 patch main.call_openai_chat）
+# 紧跟在 import 后面加
+async def call_openai_chat(messages):
+    # 委托到模块函数——如果测试 patch 了 core.client.call_openai_chat，这里也会跟着变
+    return await openai_client.call_openai_chat(messages)
+
+async def call_openai_chat_stream(messages):
+    # 同理，转发生成器
+    async for chunk in openai_client.call_openai_chat_stream(messages):
+        yield chunk
 
 load_dotenv()
 
 app = FastAPI()
+
+from auth_routes import router as auth_router
+app.include_router(auth_router)
 
 # 正确注册 CORS
 app.add_middleware(
@@ -26,6 +56,36 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+async def _maybe_schedule_memory(user_id: str):
+    try:
+        await connect()
+        database = db()
+        if database is None:
+            return
+
+        mem = await get_memory(database, user_id)
+        q = {"user_id": user_id, "role": "user"}
+        if mem and mem.get("updated_at"):
+            q["created_at"] = {"$gt": mem["updated_at"]}
+
+        new_user_count = await database["messages"].count_documents(q)
+        threshold = int(os.environ.get("SUMMARY_UPDATE_EVERY", "5"))
+
+        # 首次（mem is None）更积极一点
+        should_run = (mem is None and new_user_count >= 3) or (new_user_count >= threshold)
+        logger.info(f"[memory] user={user_id} new_user_count={new_user_count} threshold={threshold} should_run={should_run}")
+
+        if should_run:
+            async def _delayed():
+                # 给插入的消息一点时间落库（add_* 是 create_task 异步写）
+                # await asyncio.sleep(0.05)
+                await maybe_update_memory(database, user_id)
+            asyncio.create_task(_delayed())
+    except Exception as e:
+        logger.warning(f"schedule memory failed: {e}")
+
+
 
 # ------------------ 对话上下文存储 ------------------
 # 注意：上下文管理已迁移到 context_manager 模块
@@ -40,21 +100,43 @@ async def chat_proxy(request: Request):
         stream = data.get("stream", False)
 
         # 获取用户ID（这里使用默认用户，实际项目中可以从请求中获取）
-        user_id = "default_user"
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
         
         # 使用上下文管理器构建包含历史上下文的完整消息列表
-        messages_with_context = context_manager.build_context_messages(messages, user_id)
+        messages_with_context = await context_manager.build_context_messages(messages, user_id)
         
         # 注入系统 prompt
         system_prompt, updated_messages = build_prompt(messages_with_context)
 
         # **非流式模式处理：**
         if not stream:
+            updated_messages = _trim_to_turn_cap(updated_messages)
+
             # 调用 OpenAI 获取响应，传入上下文
-            full_output = await call_openai_chat(updated_messages)
+            # 晚绑定，确保 monkeypatch(main.call_openai_chat) 能命中
+            full_output = await globals()["call_openai_chat"](updated_messages)
+
+
+            tasks = []
+            # **➡️ 新增：把本轮用户输入持久化（只在最后一条确实是用户消息时写库）**
+            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
+                if t_user: tasks.append(t_user)
             
             # 将AI回复添加到上下文中
-            context_manager.add_assistant_response(full_output, user_id)
+            t_assistant = context_manager.add_assistant_response(full_output, user_id)
+            if t_assistant: tasks.append(t_assistant)
+
+            # ✅ 等待写库完成，避免记忆任务先跑导致读不到新消息
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            await _maybe_schedule_memory(user_id)
 
             # 返回生成的回答
             return JSONResponse(content={"message": full_output})
@@ -64,7 +146,12 @@ async def chat_proxy(request: Request):
             collected_response = []  # 用于收集完整的AI回复
             
             async def token_stream():
-                async for chunk in call_openai_chat_stream(updated_messages):
+                # 调流式之前也做一次 turn 上限裁剪
+                nonlocal updated_messages
+                updated_messages = _trim_to_turn_cap(updated_messages)
+                
+                # 同理，晚绑定流式函数
+                async for chunk in globals()["call_openai_chat_stream"](updated_messages):
                     try:
                         chunk_obj = json.loads(chunk)
                         delta = chunk_obj["choices"][0]["delta"]
@@ -85,7 +172,20 @@ async def chat_proxy(request: Request):
                 # 流式结束后，将完整的AI回复添加到上下文
                 if collected_response:
                     full_response = "".join(collected_response)
-                    context_manager.add_assistant_response(full_response, user_id)
+
+                    tasks = []
+                    # **➡️ 新增：写入用户消息（仅当最后一条是用户消息）**
+                    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                        t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
+                        if t_user: tasks.append(t_user)
+                    
+                    t_assistant = context_manager.add_assistant_response(full_response, user_id)
+                    if t_assistant: tasks.append(t_assistant)
+
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    await _maybe_schedule_memory(user_id)
 
             return StreamingResponse(token_stream(), media_type="text/event-stream")
     except Exception as e:
