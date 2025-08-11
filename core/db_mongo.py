@@ -4,20 +4,45 @@ import os
 import asyncio
 from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.errors import OperationFailure   # ← 新增
 
 _MONGO_CLIENT: Optional[AsyncIOMotorClient] = None
 _DB: Optional[AsyncIOMotorDatabase] = None
 
-# 仅在一次冷启动中建索引，避免重复等待
 _INDEX_LOCK = asyncio.Lock()
 _INDEXES_READY = False
 
+# 可选：严格模式，发现“同键不同名/选项”就丢弃旧索引并统一重建
+_MONGO_INDEX_STRICT = os.getenv("MONGO_INDEX_STRICT", "false").lower() in ("1", "true", "yes", "y")
+
+async def _create_index_safe(coll, keys, **kwargs):
+    """
+    幂等建索引。如果遇到 85（IndexOptionsConflict：同键已存在但名字/选项不同）：
+    - 默认：跳过，不中断（生产更稳）
+    - MONGO_INDEX_STRICT=true：删除同键旧索引后按期望选项重建（更一致）
+    """
+    try:
+        return await coll.create_index(keys, **kwargs)
+    except OperationFailure as e:
+        if getattr(e, "code", None) == 85:
+            # 同键不同名/选项
+            if _MONGO_INDEX_STRICT:
+                # 找到“键完全一致”的旧索引并删除后重建
+                idxs = await coll.list_indexes().to_list(length=None)
+                key_list = list(keys)  # [('user_id', 1), ('created_at', 1)] 这种
+                def same_key(idx):
+                    # idx["key"] 是有序字典，转为 list(tuple) 比较
+                    return list(idx["key"].items()) == key_list
+                for idx in idxs:
+                    if same_key(idx):
+                        await coll.drop_index(idx["name"])
+                        return await coll.create_index(keys, **kwargs)
+            # 非严格：跳过
+            print(f"[indexes] skip conflict on {coll.name} {keys} ({e.details.get('errmsg')})")
+            return None
+        raise
 
 async def connect() -> Optional[AsyncIOMotorDatabase]:
-    """
-    懒连接。若已连接则直接返回；若未设置 MONGODB_URI 则返回 None。
-    成功连接后会做一次 ping 并保证索引已创建。
-    """
     global _MONGO_CLIENT, _DB
 
     uri = os.getenv("MONGODB_URI")
@@ -32,7 +57,6 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
     max_pool_size = int(os.getenv("MONGODB_MAX_POOL", "10"))
     appname = os.getenv("MONGODB_APPNAME", "mingjing-fastapi")
 
-    # Atlas / Serverless 友好参数
     _MONGO_CLIENT = AsyncIOMotorClient(
         uri,
         serverSelectionTimeoutMS=server_selection_timeout_ms,
@@ -41,7 +65,6 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
         appname=appname,
     )
 
-    # 确认连通（这一步能更早暴露凭证/白名单问题）
     await _MONGO_CLIENT.admin.command("ping")
 
     _DB = _MONGO_CLIENT[dbname]
@@ -49,11 +72,7 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
 
     return _DB
 
-
 async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
-    """
-    幂等地创建需要的索引；加锁确保一次冷启动仅跑一次。
-    """
     global _INDEXES_READY
     if _INDEXES_READY:
         return
@@ -62,25 +81,29 @@ async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
         if _INDEXES_READY:
             return
 
-        # messages：按用户 + 时间；以及用户 + 角色 + 时间（查询统计更快）
-        await database["messages"].create_index(
+        # messages：按用户 + 时间；以及用户 + 角色 + 时间
+        await _create_index_safe(
+            database["messages"],
             [("user_id", 1), ("created_at", 1)],
             name="user_created_at",
         )
-        await database["messages"].create_index(
+        await _create_index_safe(
+            database["messages"],
             [("user_id", 1), ("role", 1), ("created_at", 1)],
             name="user_role_created_at",
         )
 
-        # memories：每个用户一份，唯一
-        await database["memories"].create_index(
+        # memories：每个用户唯一
+        await _create_index_safe(
+            database["memories"],
             [("user_id", 1)],
             name="mem_user_unique",
             unique=True,
         )
 
         # users：用户名小写唯一
-        await database["users"].create_index(
+        await _create_index_safe(
+            database["users"],
             [("username_lower", 1)],
             name="username_lower_unique",
             unique=True,
@@ -88,21 +111,13 @@ async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
 
         _INDEXES_READY = True
 
-
 def db() -> Optional[AsyncIOMotorDatabase]:
-    """返回已连接的 DB；未连接则为 None。"""
     return _DB
 
-
 def client() -> Optional[AsyncIOMotorClient]:
-    """返回底层客户端；未连接则为 None。"""
     return _MONGO_CLIENT
 
-
 def close() -> None:
-    """
-    主动关闭连接（测试/本地调试有用）。
-    """
     global _MONGO_CLIENT, _DB, _INDEXES_READY
     if _MONGO_CLIENT:
         _MONGO_CLIENT.close()

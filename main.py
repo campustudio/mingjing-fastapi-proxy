@@ -20,8 +20,12 @@ from core.memory_manager import SUMMARY_UPDATE_EVERY, get_memory, maybe_update_m
 
 from fastapi import FastAPI
 from core.db_mongo import connect, db
+import os
+import logging
+from asyncio import wait_for, TimeoutError as AsyncTimeout
 
-
+# --- main.py 顶部其它 import 之后，加这一行 ---
+MEMORY_RUN_INLINE = os.getenv("MEMORY_RUN_INLINE", "false").lower() in ("1", "true", "yes", "y")
 
 
 def _trim_to_turn_cap(msgs):
@@ -62,31 +66,50 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 async def _maybe_schedule_memory(user_id: str):
+    """
+    根据阈值判断是否触发记忆总结。
+    - MEMORY_RUN_INLINE=true 时，同步执行（await），确保 Serverless 环境下请求返回前完成；
+    - 否则，后台异步 create_task，不阻塞主请求。
+    """
     try:
         await connect()
         database = db()
         if database is None:
             return
 
-        mem = await get_memory(database, user_id)
-        q = {"user_id": user_id, "role": "user"}
-        if mem and mem.get("updated_at"):
-            q["created_at"] = {"$gt": mem["updated_at"]}
+        # 只数 user 消息（你已有逻辑）
+        total_user = await database["messages"].count_documents(
+            {"user_id": user_id, "role": "user"}
+        )
+        should_run = bool(total_user > 0 and total_user % SUMMARY_UPDATE_EVERY == 0)
+        logger.info(
+            f"[memory] user={user_id} total_user={total_user} "
+            f"threshold={SUMMARY_UPDATE_EVERY} should_run={should_run}"
+        )
+        logger.info(f"[memory] inline={MEMORY_RUN_INLINE} user={user_id}")
 
-        new_user_count = await database["messages"].count_documents(q)
-        threshold = SUMMARY_UPDATE_EVERY
+        if not should_run:
+            return
 
-        # 首次（mem is None）更积极一点
-        should_run = (mem is None and new_user_count >= 3) or (new_user_count >= threshold)
-        logger.info(f"[memory] user={user_id} new_user_count={new_user_count} threshold={threshold} should_run={should_run}")
-
-        if should_run:
+        if MEMORY_RUN_INLINE:
+            # ✅ 同步执行：请求结束前把总结写入 DB（适合 Vercel/Fly 等 Serverless）
+            try:
+                await wait_for(maybe_update_memory(database, user_id), timeout=8)
+            except AsyncTimeout:
+                logger.warning("maybe_update_memory timed out (inline)")
+        else:
+            # ✅ 异步执行：不阻塞请求（适合常驻容器/有后台任务能力的环境）
             async def _delayed():
-                await asyncio.sleep(0) # 让当前事件循环先 flush 写库
-                await maybe_update_memory(database, user_id)
+                try:
+                    await maybe_update_memory(database, user_id)
+                except Exception as e:
+                    logger.warning(f"maybe_update_memory (bg) failed: {e}")
+
             asyncio.create_task(_delayed())
+
     except Exception as e:
         logger.warning(f"schedule memory failed: {e}")
+
 
 # ---- Health check (pre-warm DB & create indexes) ----
 @app.get("/health", tags=["infra"])
