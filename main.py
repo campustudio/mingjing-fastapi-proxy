@@ -88,12 +88,24 @@ async def _maybe_schedule_memory(user_id: str):
     except Exception as e:
         logger.warning(f"schedule memory failed: {e}")
 
-
-
-@app.get("/health")
+# ---- Health check (pre-warm DB & create indexes) ----
+@app.get("/health", tags=["infra"])
 async def health():
-    await connect()
-    return {"ok": True, "db": bool(db() is not None)}
+    try:
+        await connect()                 # 触发连接 & 幂等建索引
+        database = db()
+        db_ok = False
+        if database is not None:
+            try:
+                # 轻量 ping，确保连接正常
+                await database.command("ping")
+                db_ok = True
+            except Exception:
+                db_ok = False
+        return {"ok": True, "db": db_ok}
+    except Exception as e:
+        # 不额外引入依赖，直接返回简易错误结构
+        return {"ok": False, "error": str(e)}
 
 # ------------------ 对话上下文存储 ------------------
 # 注意：上下文管理已迁移到 context_manager 模块
