@@ -10,10 +10,11 @@ from weakref import WeakKeyDictionary  # ← 新增
 _MONGO_CLIENT: Optional[AsyncIOMotorClient] = None
 _DB: Optional[AsyncIOMotorDatabase] = None
 
-# ❌ 不要在模块级直接创建 asyncio.Lock()
-# _INDEX_LOCK = asyncio.Lock()
-# ✅ 改为：按“事件循环”维护锁，避免跨循环复用
+# ---------------- per-event-loop 资源 ----------------
+# per-loop 锁：避免跨事件循环复用导致 "Event loop is closed"
 _INDEX_LOCKS: "WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = WeakKeyDictionary()
+# per-loop 就绪标记：每个 loop 只为同一个 DB 建一次索引
+_INDEX_READY_BY_LOOP: "WeakKeyDictionary[asyncio.AbstractEventLoop, set[str]]" = WeakKeyDictionary()
 
 def _get_index_lock() -> asyncio.Lock:
     loop = asyncio.get_running_loop()
@@ -23,35 +24,41 @@ def _get_index_lock() -> asyncio.Lock:
         _INDEX_LOCKS[loop] = lock
     return lock
 
+def _is_index_ready_for_db(database: AsyncIOMotorDatabase) -> bool:
+    loop = asyncio.get_running_loop()
+    ready = _INDEX_READY_BY_LOOP.get(loop)
+    return ready is not None and database.name in ready
+
+def _mark_index_ready_for_db(database: AsyncIOMotorDatabase) -> None:
+    loop = asyncio.get_running_loop()
+    ready = _INDEX_READY_BY_LOOP.get(loop)
+    if ready is None:
+        ready = set()
+        _INDEX_READY_BY_LOOP[loop] = ready
+    ready.add(database.name)
+
 _INDEXES_READY = False
 
-# 可选：严格模式，发现“同键不同名/选项”就丢弃旧索引并统一重建
+# 可选严格模式：遇到“同键不同名/选项”的旧索引时是否先删再建
 _MONGO_INDEX_STRICT = os.getenv("MONGO_INDEX_STRICT", "false").lower() in ("1", "true", "yes", "y")
 
 async def _create_index_safe(coll, keys, **kwargs):
-    """
-    幂等建索引。如果遇到 85（IndexOptionsConflict：同键已存在但名字/选项不同）：
-    - 默认：跳过，不中断（生产更稳）
-    - MONGO_INDEX_STRICT=true：删除同键旧索引后按期望选项重建（更一致）
-    """
     try:
         return await coll.create_index(keys, **kwargs)
     except OperationFailure as e:
         if getattr(e, "code", None) == 85:
-            # 同键不同名/选项
             if _MONGO_INDEX_STRICT:
-                # 找到“键完全一致”的旧索引并删除后重建
                 idxs = await coll.list_indexes().to_list(length=None)
-                key_list = list(keys)  # [('user_id', 1), ('created_at', 1)] 这种
+                key_list = list(keys)
                 def same_key(idx):
-                    # idx["key"] 是有序字典，转为 list(tuple) 比较
                     return list(idx["key"].items()) == key_list
                 for idx in idxs:
                     if same_key(idx):
                         await coll.drop_index(idx["name"])
                         return await coll.create_index(keys, **kwargs)
             # 非严格：跳过
-            print(f"[indexes] skip conflict on {coll.name} {keys} ({e.details.get('errmsg')})")
+            msg = e.details.get("errmsg") if getattr(e, "details", None) else str(e)
+            print(f"[indexes] skip conflict on {coll.name} {keys} ({msg})")
             return None
         raise
 
@@ -61,7 +68,6 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
     uri = os.getenv("MONGODB_URI")
     if not uri:
         return None
-
     if _DB is not None:
         return _DB
 
@@ -77,18 +83,24 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
         uuidRepresentation="standard",
         appname=appname,
     )
-
+    # 及早发现凭据/白名单错误
     await _MONGO_CLIENT.admin.command("ping")
 
     _DB = _MONGO_CLIENT[dbname]
     await _ensure_indexes(_DB)
-
     return _DB
 
 async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
-    # 用“按事件循环隔离”的锁
+    # 第一层检查：同一个 loop / 同一个 DB 已经建过就跳过
+    if _is_index_ready_for_db(database):
+        return
+
     async with _get_index_lock():
-        # messages
+        # 双检，防止并发重复建
+        if _is_index_ready_for_db(database):
+            return
+
+        # messages：时间线/统计友好
         await _create_index_safe(
             database["messages"],
             [("user_id", 1), ("created_at", 1)],
@@ -99,20 +111,22 @@ async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
             [("user_id", 1), ("role", 1), ("created_at", 1)],
             name="user_role_created_at",
         )
-        # memories：唯一
+        # memories：每个用户唯一
         await _create_index_safe(
             database["memories"],
             [("user_id", 1)],
             name="mem_user_unique",
             unique=True,
         )
-        # users：唯一
+        # users：用户名小写唯一
         await _create_index_safe(
             database["users"],
             [("username_lower", 1)],
             name="username_lower_unique",
             unique=True,
         )
+
+        _mark_index_ready_for_db(database)
         
 def db() -> Optional[AsyncIOMotorDatabase]:
     return _DB
@@ -121,9 +135,12 @@ def client() -> Optional[AsyncIOMotorClient]:
     return _MONGO_CLIENT
 
 def close() -> None:
-    global _MONGO_CLIENT, _DB, _INDEXES_READY
+    """测试/本地调试时主动清理连接与缓存。"""
+    global _MONGO_CLIENT, _DB
     if _MONGO_CLIENT:
         _MONGO_CLIENT.close()
     _MONGO_CLIENT = None
     _DB = None
-    _INDEXES_READY = False
+    # 清理 per-loop 缓存，避免下次测试串状态
+    _INDEX_LOCKS.clear()
+    _INDEX_READY_BY_LOOP.clear()

@@ -105,10 +105,19 @@ class MongoContextManager:
         merged = fit_budget(merged, self.token_budget)
         return merged
 
-    def _schedule(self, coro: Awaitable[None]) -> Optional[Awaitable[None]]:
-        # Serverless（Vercel）：返回协程 -> 由调用方 await（DB_WRITE_INLINE=true）
-        # 常驻容器：直接创建后台 Task（默认）
-        return coro if DB_WRITE_INLINE else asyncio.create_task(coro)
+    def _schedule(self, coro):
+        """
+        在 Serverless（或配置 DB_WRITE_INLINE=true）下，返回协程给调用方 await；
+        其他环境返回 Task（后台写入）。
+        """
+        if DB_WRITE_INLINE:
+            return coro
+        try:
+            loop = asyncio.get_running_loop()
+            return loop.create_task(coro)
+        except RuntimeError:
+            # 没有运行中的 loop（Serverless 冷启动/收尾阶段），退回协程
+            return coro
 
     def add_message_to_context(self, message: Dict[str, Any], user_id: str = "default_user"):
         role = message.get("role")
