@@ -8,3 +8,4 @@ passlib[bcrypt]
 asgi-vercel
 pydantic
 pymongo
+starlette
