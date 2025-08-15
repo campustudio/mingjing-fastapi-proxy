@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 import asyncio, os
 from .db_mongo import db, connect
 from .memory_manager import get_memory, build_memory_preamble
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Awaitable
 from core.config import CONTEXT_MAX_TURNS
+import os, asyncio
+DB_WRITE_INLINE = os.getenv("DB_WRITE_INLINE", "false").lower() in ("1","true","yes","y")
 
 DEFAULT_TOKEN_BUDGET = int(os.getenv("CONTEXT_TOKEN_BUDGET", "6000"))
 DEFAULT_TURNS = CONTEXT_MAX_TURNS
@@ -103,26 +105,31 @@ class MongoContextManager:
         merged = fit_budget(merged, self.token_budget)
         return merged
 
+    def _schedule(self, coro: Awaitable[None]) -> Optional[Awaitable[None]]:
+        # Serverless（Vercel）：返回协程 -> 由调用方 await（DB_WRITE_INLINE=true）
+        # 常驻容器：直接创建后台 Task（默认）
+        return coro if DB_WRITE_INLINE else asyncio.create_task(coro)
+
     def add_message_to_context(self, message: Dict[str, Any], user_id: str = "default_user"):
         role = message.get("role")
         content = message.get("content")
         if not content or role not in {"system", "user", "assistant", "tool"}:
             return None
         # 返回 Task，供调用方 await
-        return asyncio.create_task(self._insert_message(role, content, user_id))
+        return self._schedule(self._insert_message(role, content, user_id))
 
     def add_user_message(self, message_content: str, user_id: str = "default_user"):
         if not message_content:
             return None
-        return asyncio.create_task(self._insert_message("user", message_content, user_id))
+        return self._schedule(self._insert_message("user", message_content, user_id))
 
     def add_assistant_response(self, response_content: str, user_id: str = "default_user"):
         if not response_content:
             return None
-        return asyncio.create_task(self._insert_message("assistant", response_content, user_id))
+        return self._schedule(self._insert_message("assistant", response_content, user_id))
 
     def clear_context(self, user_id: str = "default_user"):
-        asyncio.create_task(self._insert_message("system", "[context cleared]", user_id))
+        return self._schedule(self._insert_message("system", "[context cleared]", user_id))
 
     async def _insert_message(self, role: str, content: str, user_id: str):
         await self._ensure()
