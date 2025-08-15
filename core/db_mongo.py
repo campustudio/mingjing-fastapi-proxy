@@ -82,32 +82,39 @@ async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
             return
 
         # messages：按用户 + 时间；以及用户 + 角色 + 时间
-        await _create_index_safe(
-            database["messages"],
-            [("user_id", 1), ("created_at", 1)],
-            name="user_created_at",
-        )
-        await _create_index_safe(
-            database["messages"],
-            [("user_id", 1), ("role", 1), ("created_at", 1)],
-            name="user_role_created_at",
-        )
+        try:
+            await database["messages"]._create_index_safe(
+                [("user_id", 1), ("created_at", 1)]
+            )
+        except OperationFailure as e:
+            if getattr(e, "code", None) != 85:  # IndexOptionsConflict
+                raise
+
+        try:
+            await database["messages"]._create_index_safe(
+                [("user_id", 1), ("role", 1), ("created_at", 1)]
+            )
+        except OperationFailure as e:
+            if getattr(e, "code", None) != 85:
+                raise
 
         # memories：每个用户唯一
-        await _create_index_safe(
-            database["memories"],
-            [("user_id", 1)],
-            name="mem_user_unique",
-            unique=True,
-        )
+        try:
+            await database["memories"]._create_index_safe(
+                [("user_id", 1)], unique=True
+            )
+        except OperationFailure as e:
+            if getattr(e, "code", None) != 85:
+                raise
 
         # users：用户名小写唯一
-        await _create_index_safe(
-            database["users"],
-            [("username_lower", 1)],
-            name="username_lower_unique",
-            unique=True,
-        )
+        try:
+            await database["users"]._create_index_safe(
+                [("username_lower", 1)], unique=True
+            )
+        except OperationFailure as e:
+            if getattr(e, "code", None) != 85:
+                raise
 
         _INDEXES_READY = True
 

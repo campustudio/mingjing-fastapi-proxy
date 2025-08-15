@@ -1,6 +1,9 @@
-# api/index.py
-from asgi_vercel import AsgiHandler
-# 这个文件非常关键：把 FastAPI 的 app 暴露给 Vercel
-from main import app  # 你的 FastAPI 实例
+from asgi_vercel import AsgiHandler, VercelResponse
+from main import app as fastapi_app
 
-handler = AsgiHandler(app)
+# Vercel 入口
+handler = AsgiHandler(fastapi_app)
+
+# 可选：/api/index.py 直连测试用
+async def index(request):
+    return VercelResponse("OK", status_code=200)
