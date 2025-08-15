@@ -107,7 +107,6 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
     await _ensure_indexes(db)
     return db
 
-            unique=True,
 def db() -> Optional[AsyncIOMotorDatabase]:
     """取当前事件循环的 DB 实例。"""
     return _DBS.get(_get_loop())
