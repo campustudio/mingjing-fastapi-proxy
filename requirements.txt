@@ -7,3 +7,4 @@ python-jose[cryptography]
 passlib[bcrypt]
 asgi-vercel
 pydantic
+pymongo
