@@ -7,8 +7,14 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Any, Dict
 import asyncio
 from . import client as openai_client
+from weakref import WeakKeyDictionary
 
 import re
+
+# 旧：_LOCKS: Dict[str, asyncio.Lock] = {}
+# 新：按事件循环隔离
+_USER_LOCKS_BY_LOOP: "WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]" = WeakKeyDictionary()
+
 
 _BULLET_PREFIX = re.compile(r"""^\s*
     (?:[-*•·●▪‣◦\u2022\u00B7]|—|–|－|·|•)  # -,*,•,·,各种圆点/破折号
@@ -50,10 +56,15 @@ MEMORY_PREAMBLE_FACTS_TITLE = "## Facts"
 _USER_LOCKS: dict[str, asyncio.Lock] = {}
 
 def _get_user_lock(user_id: str) -> asyncio.Lock:
-    lock = _USER_LOCKS.get(user_id)
+    loop = asyncio.get_running_loop()
+    table = _USER_LOCKS_BY_LOOP.get(loop)
+    if table is None:
+        table = {}
+        _USER_LOCKS_BY_LOOP[loop] = table
+    lock = table.get(user_id)
     if lock is None:
         lock = asyncio.Lock()
-        _USER_LOCKS[user_id] = lock
+        table[user_id] = lock
     return lock
 
 def _now():

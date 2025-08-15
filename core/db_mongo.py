@@ -5,11 +5,24 @@ import asyncio
 from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import OperationFailure   # ← 新增
+from weakref import WeakKeyDictionary  # ← 新增
 
 _MONGO_CLIENT: Optional[AsyncIOMotorClient] = None
 _DB: Optional[AsyncIOMotorDatabase] = None
 
-_INDEX_LOCK = asyncio.Lock()
+# ❌ 不要在模块级直接创建 asyncio.Lock()
+# _INDEX_LOCK = asyncio.Lock()
+# ✅ 改为：按“事件循环”维护锁，避免跨循环复用
+_INDEX_LOCKS: "WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = WeakKeyDictionary()
+
+def _get_index_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _INDEX_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _INDEX_LOCKS[loop] = lock
+    return lock
+
 _INDEXES_READY = False
 
 # 可选：严格模式，发现“同键不同名/选项”就丢弃旧索引并统一重建
@@ -73,46 +86,34 @@ async def connect() -> Optional[AsyncIOMotorDatabase]:
     return _DB
 
 async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
-    global _INDEXES_READY
-    if _INDEXES_READY:
-        return
-
-    async with _INDEX_LOCK:
-        if _INDEXES_READY:
-            return
-
-        # messages：按用户 + 时间
+    # 用“按事件循环隔离”的锁
+    async with _get_index_lock():
+        # messages
         await _create_index_safe(
             database["messages"],
             [("user_id", 1), ("created_at", 1)],
             name="user_created_at",
         )
-
-        # messages：按用户 + 角色 + 时间
         await _create_index_safe(
             database["messages"],
             [("user_id", 1), ("role", 1), ("created_at", 1)],
             name="user_role_created_at",
         )
-
-        # memories：每个用户唯一
+        # memories：唯一
         await _create_index_safe(
             database["memories"],
             [("user_id", 1)],
             name="mem_user_unique",
             unique=True,
         )
-
-        # users：用户名小写唯一
+        # users：唯一
         await _create_index_safe(
             database["users"],
             [("username_lower", 1)],
             name="username_lower_unique",
             unique=True,
         )
-
-        _INDEXES_READY = True
-
+        
 def db() -> Optional[AsyncIOMotorDatabase]:
     return _DB
 
