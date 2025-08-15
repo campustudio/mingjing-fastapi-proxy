@@ -24,12 +24,9 @@ class MongoContextManager:
     def __init__(self, max_context_length: int = DEFAULT_TURNS, token_budget: int = DEFAULT_TOKEN_BUDGET):
         self.max_context_length = max_context_length
         self.token_budget = token_budget
-        self._connected = False
 
     async def _ensure(self):
-        if not self._connected:
-            await connect()
-            self._connected = True
+        await connect()
 
     async def build_context_messages(self, new_messages: List[Dict[str, Any]], user_id: str = "default_user") -> List[Dict[str, Any]]:
         await self._ensure()
