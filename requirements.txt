@@ -9,3 +9,4 @@ pydantic
 pymongo
 starlette
 dnspython
+python-docx

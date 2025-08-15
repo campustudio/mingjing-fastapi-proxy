@@ -81,40 +81,35 @@ async def _ensure_indexes(database: AsyncIOMotorDatabase) -> None:
         if _INDEXES_READY:
             return
 
-        # messages：按用户 + 时间；以及用户 + 角色 + 时间
-        try:
-            await database["messages"]._create_index_safe(
-                [("user_id", 1), ("created_at", 1)]
-            )
-        except OperationFailure as e:
-            if getattr(e, "code", None) != 85:  # IndexOptionsConflict
-                raise
+        # messages：按用户 + 时间
+        await _create_index_safe(
+            database["messages"],
+            [("user_id", 1), ("created_at", 1)],
+            name="user_created_at",
+        )
 
-        try:
-            await database["messages"]._create_index_safe(
-                [("user_id", 1), ("role", 1), ("created_at", 1)]
-            )
-        except OperationFailure as e:
-            if getattr(e, "code", None) != 85:
-                raise
+        # messages：按用户 + 角色 + 时间
+        await _create_index_safe(
+            database["messages"],
+            [("user_id", 1), ("role", 1), ("created_at", 1)],
+            name="user_role_created_at",
+        )
 
         # memories：每个用户唯一
-        try:
-            await database["memories"]._create_index_safe(
-                [("user_id", 1)], unique=True
-            )
-        except OperationFailure as e:
-            if getattr(e, "code", None) != 85:
-                raise
+        await _create_index_safe(
+            database["memories"],
+            [("user_id", 1)],
+            name="mem_user_unique",
+            unique=True,
+        )
 
         # users：用户名小写唯一
-        try:
-            await database["users"]._create_index_safe(
-                [("username_lower", 1)], unique=True
-            )
-        except OperationFailure as e:
-            if getattr(e, "code", None) != 85:
-                raise
+        await _create_index_safe(
+            database["users"],
+            [("username_lower", 1)],
+            name="username_lower_unique",
+            unique=True,
+        )
 
         _INDEXES_READY = True
 
