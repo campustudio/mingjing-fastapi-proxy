@@ -1,7 +1,9 @@
 {
   "version": 2,
-  "functions": {
-    "api/index.py": { "runtime": "python3.11" }
-  },
-  "routes": [{ "src": "/(.*)", "dest": "/api/index.py" }]
+  "routes": [
+    { "src": "/health", "dest": "/api/index.py" },
+    { "src": "/v1/chat/completions", "dest": "/api/index.py" },
+    { "src": "/auth/(.*)", "dest": "/api/index.py" },
+    { "src": "/(.*)", "dest": "/api/index.py" }
+  ]
 }
