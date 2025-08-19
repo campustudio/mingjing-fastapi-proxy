@@ -5,13 +5,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import logging
 from dotenv import load_dotenv
 import json
+load_dotenv()
 
 from core import client as openai_client
 from core.prompt_builder import build_prompt
 from core.signer import inject_signature
 from core.auth_utils import decode_jwt
 from core.context_manager import context_manager
-
 from core.db_mongo import db, connect
 
 import asyncio
@@ -46,7 +46,6 @@ async def call_openai_chat_stream(messages):
     async for chunk in openai_client.call_openai_chat_stream(messages):
         yield chunk
 
-load_dotenv()
 
 app = FastAPI()
 

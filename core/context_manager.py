@@ -4,8 +4,39 @@ from typing import List, Dict, Any
 from core.config import CONTEXT_MAX_TURNS
 
 MONGODB_URI = os.getenv("MONGODB_URI")
+PURE_CONTEXT = os.getenv("PURE_CONTEXT", "false").lower() in ("1", "true", "yes", "y")
 
-if False and MONGODB_URI:
+if PURE_CONTEXT:
+    class NoopContextManager:
+        """
+        纯净模式：不维护任何上下文，也不做任何写入。
+        """
+        def __init__(self, max_context_length: int = 10):
+            self.max_context_length = max_context_length
+
+        async def build_context_messages(self, new_messages: List[Dict[str, Any]], user_id: str = "default_user") -> List[Dict[str, Any]]:
+            # 仅返回本次请求的最后一条 user（如无则空），不附带历史
+            if new_messages and isinstance(new_messages[-1], dict):
+                maybe = new_messages[-1]
+                if maybe.get("role") == "user" and maybe.get("content"):
+                    return [{"role": "user", "content": maybe["content"]}]
+            return []
+
+        def add_message_to_context(self, message: Dict[str, Any], user_id: str = "default_user"):
+            return
+
+        def add_user_message(self, message_content: str, user_id: str = "default_user"):
+            return
+
+        def add_assistant_response(self, response_content: str, user_id: str = "default_user"):
+            return
+
+        def clear_context(self, user_id: str = "default_user"):
+            return
+
+    context_manager = NoopContextManager(max_context_length=CONTEXT_MAX_TURNS)
+
+elif MONGODB_URI:
     from .context_manager_mongo import MongoContextManager
     context_manager = MongoContextManager(max_context_length=CONTEXT_MAX_TURNS)
 else:
