@@ -150,33 +150,34 @@ async def chat_proxy(request: Request):
                 user_id = data["sub"]
         
         # 使用上下文管理器构建包含历史上下文的完整消息列表
-        messages_with_context = await context_manager.build_context_messages(messages, user_id)
+        # messages_with_context = await context_manager.build_context_messages(messages, user_id)
         
         # 注入系统 prompt
-        system_prompt, updated_messages = build_prompt(messages_with_context)
+        # system_prompt, updated_messages = build_prompt(messages_with_context)
+        updated_messages = messages
 
         # **非流式模式处理：**
         if not stream:
-            updated_messages = _trim_to_turn_cap(updated_messages)
+            # updated_messages = _trim_to_turn_cap(updated_messages)
 
             # 调用 OpenAI 获取响应，传入上下文
             # 晚绑定，确保 monkeypatch(main.call_openai_chat) 能命中
             full_output = await globals()["call_openai_chat"](updated_messages)
 
 
-            tasks = []
-            # **➡️ 新增：把本轮用户输入持久化（只在最后一条确实是用户消息时写库）**
-            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-                t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
-                if t_user: tasks.append(t_user)
+            # tasks = []
+            # # **➡️ 新增：把本轮用户输入持久化（只在最后一条确实是用户消息时写库）**
+            # if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+            #     t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
+            #     if t_user: tasks.append(t_user)
             
-            # 将AI回复添加到上下文中
-            t_assistant = context_manager.add_assistant_response(full_output, user_id)
-            if t_assistant: tasks.append(t_assistant)
+            # # 将AI回复添加到上下文中
+            # t_assistant = context_manager.add_assistant_response(full_output, user_id)
+            # if t_assistant: tasks.append(t_assistant)
 
-            # ✅ 等待写库完成，避免记忆任务先跑导致读不到新消息
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            # # ✅ 等待写库完成，避免记忆任务先跑导致读不到新消息
+            # if tasks:
+            #     await asyncio.gather(*tasks, return_exceptions=True)
 
             # await _maybe_schedule_memory(user_id)
 
@@ -190,7 +191,7 @@ async def chat_proxy(request: Request):
             async def token_stream():
                 # 调流式之前也做一次 turn 上限裁剪
                 nonlocal updated_messages
-                updated_messages = _trim_to_turn_cap(updated_messages)
+                # updated_messages = _trim_to_turn_cap(updated_messages)
                 
                 # 同理，晚绑定流式函数
                 async for chunk in globals()["call_openai_chat_stream"](updated_messages):
@@ -205,27 +206,29 @@ async def chat_proxy(request: Request):
                         collected_response.append(content)
 
                         # 返回 GPT 响应，并注入签名
-                        signed = inject_signature(content)
-                        yield f"data: {signed}\n\n"
+                        # signed = inject_signature(content)
+                        # yield f"data: {signed}\n\n"
+
+                        yield f"data: {content}\n\n"
 
                     except Exception as e:
                         logger.warning(f"❌ 流式 chunk 解析失败: {e}")
                 
                 # 流式结束后，将完整的AI回复添加到上下文
-                if collected_response:
-                    full_response = "".join(collected_response)
+                # if collected_response:
+                #     full_response = "".join(collected_response)
 
-                    tasks = []
-                    # **➡️ 新增：写入用户消息（仅当最后一条是用户消息）**
-                    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-                        t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
-                        if t_user: tasks.append(t_user)
+                #     tasks = []
+                #     # **➡️ 新增：写入用户消息（仅当最后一条是用户消息）**
+                #     if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                #         t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
+                #         if t_user: tasks.append(t_user)
                     
-                    t_assistant = context_manager.add_assistant_response(full_response, user_id)
-                    if t_assistant: tasks.append(t_assistant)
+                #     t_assistant = context_manager.add_assistant_response(full_response, user_id)
+                #     if t_assistant: tasks.append(t_assistant)
 
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                #     if tasks:
+                #         await asyncio.gather(*tasks, return_exceptions=True)
                     
                     # await _maybe_schedule_memory(user_id)
 
