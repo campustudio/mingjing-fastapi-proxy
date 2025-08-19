@@ -4,8 +4,11 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 from core.db_mongo import connect, db
 from core.auth_utils import create_jwt
+import os
+import hashlib
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+PURE_AUTH = os.getenv("PURE_AUTH", "false").lower() in ("1","true","yes","y")
 
 class QuickLoginIn(BaseModel):
     username: str
@@ -21,6 +24,14 @@ async def quick_login(payload: QuickLoginIn):
     username = (payload.username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="username required")
+
+    # 纯净认证模式：不依赖数据库，直接签发临时用户令牌
+    if PURE_AUTH:
+        # 生成 ASCII-safe 的稳定 uid（避免把中文/Emoji 放入 header/localStorage）
+        uid_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()[:16]
+        user_id = f"u:{uid_hash}"
+        token = create_jwt(user_id, username)
+        return TokenOut(access_token=token, user_id=user_id, username=username)
     await connect()
     database = db()
     if database is None:
