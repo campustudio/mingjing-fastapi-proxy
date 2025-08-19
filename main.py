@@ -115,16 +115,16 @@ async def _maybe_schedule_memory(user_id: str):
 @app.get("/health", tags=["infra"])
 async def health():
     try:
-        await connect()                 # 触发连接 & 幂等建索引
-        database = db()
+        # await connect()                 # 触发连接 & 幂等建索引
+        # database = db()
         db_ok = False
-        if database is not None:
-            try:
-                # 轻量 ping，确保连接正常
-                await database.command("ping")
-                db_ok = True
-            except Exception:
-                db_ok = False
+        # if database is not None:
+        #     try:
+        #         # 轻量 ping，确保连接正常
+        #         await database.command("ping")
+        #         db_ok = True
+        #     except Exception:
+        #         db_ok = False
         return {"ok": True, "db": db_ok}
     except Exception as e:
         # 不额外引入依赖，直接返回简易错误结构
@@ -179,7 +179,7 @@ async def chat_proxy(request: Request):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            await _maybe_schedule_memory(user_id)
+            # await _maybe_schedule_memory(user_id)
 
             # 返回生成的回答
             return JSONResponse(content={"message": full_output})
@@ -228,7 +228,7 @@ async def chat_proxy(request: Request):
                     if tasks:
                         await asyncio.gather(*tasks, return_exceptions=True)
                     
-                    await _maybe_schedule_memory(user_id)
+                    # await _maybe_schedule_memory(user_id)
 
             return StreamingResponse(token_stream(), media_type="text/event-stream", headers={
                 "Cache-Control": "no-cache",

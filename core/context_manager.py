@@ -5,7 +5,7 @@ from core.config import CONTEXT_MAX_TURNS
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 
-if MONGODB_URI:
+if False and MONGODB_URI:
     from .context_manager_mongo import MongoContextManager
     context_manager = MongoContextManager(max_context_length=CONTEXT_MAX_TURNS)
 else:
