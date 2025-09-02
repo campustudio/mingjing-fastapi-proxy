@@ -154,7 +154,8 @@ async def chat_proxy(request: Request):
         
         # 注入系统 prompt
         # system_prompt, updated_messages = build_prompt(messages_with_context)
-        updated_messages = messages
+        # updated_messages = messages
+        system_prompt, updated_messages = build_prompt(messages)
 
         # **非流式模式处理：**
         if not stream:
