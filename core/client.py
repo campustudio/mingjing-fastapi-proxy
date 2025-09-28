@@ -5,6 +5,7 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 

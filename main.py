@@ -1,33 +1,63 @@
 # main.py
+import logging
+import json
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-import logging
-from dotenv import load_dotenv
-import json
+
 load_dotenv()
 
 from core import client as openai_client
 from core.prompt_builder import build_prompt
-from core.signer import inject_signature
 from core.auth_utils import decode_jwt
 from core.context_manager import context_manager
 from core.db_mongo import db, connect
-
-import asyncio
 from core.config import CONTEXT_MAX_TURNS
 from core.memory_manager import SUMMARY_UPDATE_EVERY, get_memory, maybe_update_memory
 
-from fastapi import FastAPI
-from core.db_mongo import connect, db
-import os
-import logging
+import asyncio
 from asyncio import wait_for, TimeoutError as AsyncTimeout
+from auth_routes import router as auth_router
+import os
 
 # --- main.py 顶部其它 import 之后，加这一行 ---
 MEMORY_RUN_INLINE = os.getenv("MEMORY_RUN_INLINE", "false").lower() in ("1", "true", "yes", "y")
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+app = FastAPI()
+app.include_router(auth_router)
+# 正确注册 CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Health check (pre-warm DB & create indexes) ----
+@app.get("/health", tags=["infra"])
+async def health():
+    try:
+        await connect() # 触发连接 & 幂等建索引
+        database = db()
+        db_ok = False
+        if database is not None:
+            try:
+                # 轻量 ping，确保连接正常
+                await database.command("ping")
+                db_ok = True
+            except Exception:
+                db_ok = False
+        return {"ok": True, "db": db_ok}
+    except Exception as e:
+        # 不额外引入依赖，直接返回简易错误结构
+        return {"ok": False, "error": str(e)}
+
+# 裁剪消息到 turn 上限
 def _trim_to_turn_cap(msgs):
     cap = 2 * CONTEXT_MAX_TURNS
     if len(msgs) <= cap:
@@ -45,24 +75,6 @@ async def call_openai_chat_stream(messages):
     # 同理，转发生成器
     async for chunk in openai_client.call_openai_chat_stream(messages):
         yield chunk
-
-
-app = FastAPI()
-
-from auth_routes import router as auth_router
-app.include_router(auth_router)
-
-# 正确注册 CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 async def _maybe_schedule_memory(user_id: str):
     """
@@ -105,35 +117,13 @@ async def _maybe_schedule_memory(user_id: str):
                     logger.warning(f"maybe_update_memory (bg) failed: {e}")
 
             asyncio.create_task(_delayed())
-
     except Exception as e:
         logger.warning(f"schedule memory failed: {e}")
-
-
-# ---- Health check (pre-warm DB & create indexes) ----
-@app.get("/health", tags=["infra"])
-async def health():
-    try:
-        # await connect()                 # 触发连接 & 幂等建索引
-        # database = db()
-        db_ok = False
-        # if database is not None:
-        #     try:
-        #         # 轻量 ping，确保连接正常
-        #         await database.command("ping")
-        #         db_ok = True
-        #     except Exception:
-        #         db_ok = False
-        return {"ok": True, "db": db_ok}
-    except Exception as e:
-        # 不额外引入依赖，直接返回简易错误结构
-        return {"ok": False, "error": str(e)}
 
 # ------------------ 对话上下文存储 ------------------
 # 注意：上下文管理已迁移到 context_manager 模块
 
 # ------------------ 核心接口：聊天代理 ------------------
-
 @app.post("/v1/chat/completions")
 async def chat_proxy(request: Request):
     try:
@@ -165,7 +155,6 @@ async def chat_proxy(request: Request):
             # 晚绑定，确保 monkeypatch(main.call_openai_chat) 能命中
             full_output = await globals()["call_openai_chat"](updated_messages)
 
-
             # tasks = []
             # # **➡️ 新增：把本轮用户输入持久化（只在最后一条确实是用户消息时写库）**
             # if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
@@ -184,14 +173,13 @@ async def chat_proxy(request: Request):
 
             # 返回生成的回答
             return JSONResponse(content={"message": full_output})
-
         else:
             # **流式模式：**
             collected_response = []  # 用于收集完整的AI回复
             
             async def token_stream():
-                # 调流式之前也做一次 turn 上限裁剪
                 nonlocal updated_messages
+                # 调流式之前也做一次 turn 上限裁剪
                 # updated_messages = _trim_to_turn_cap(updated_messages)
                 
                 # 同理，晚绑定流式函数
@@ -205,10 +193,6 @@ async def chat_proxy(request: Request):
                         
                         # 收集完整回复用于上下文管理
                         collected_response.append(content)
-
-                        # 返回 GPT 响应，并注入签名
-                        # signed = inject_signature(content)
-                        # yield f"data: {signed}\n\n"
 
                         yield f"data: {content}\n\n"
 
@@ -231,7 +215,7 @@ async def chat_proxy(request: Request):
                 #     if tasks:
                 #         await asyncio.gather(*tasks, return_exceptions=True)
                     
-                    # await _maybe_schedule_memory(user_id)
+                #     await _maybe_schedule_memory(user_id)
 
             return StreamingResponse(token_stream(), media_type="text/event-stream", headers={
                 "Cache-Control": "no-cache",

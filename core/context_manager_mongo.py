@@ -8,8 +8,8 @@ from .memory_manager import get_memory, build_memory_preamble
 from typing import List, Dict, Any, Optional, Awaitable
 from core.config import CONTEXT_MAX_TURNS
 import os, asyncio
-DB_WRITE_INLINE = os.getenv("DB_WRITE_INLINE", "false").lower() in ("1","true","yes","y")
 
+DB_WRITE_INLINE = os.getenv("DB_WRITE_INLINE", "false").lower() in ("1","true","yes","y")
 DEFAULT_TOKEN_BUDGET = int(os.getenv("CONTEXT_TOKEN_BUDGET", "6000"))
 DEFAULT_TURNS = CONTEXT_MAX_TURNS
 
