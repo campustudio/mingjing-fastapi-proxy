@@ -139,13 +139,17 @@ async def chat_proxy(request: Request):
             if data and data.get("sub"):
                 user_id = data["sub"]
         
-        # 使用上下文管理器构建包含历史上下文的完整消息列表
-        # messages_with_context = await context_manager.build_context_messages(messages, user_id)
+        # 记录当前上下文管理器类型（便于诊断 PURE_CONTEXT / Mongo 是否生效）
+        try:
+            logger.info(f"[context] manager={type(context_manager).__name__}")
+        except Exception:
+            pass
+
+        # 使用上下文管理器构建包含历史上下文的完整消息列表（恢复 DB 上下文）
+        messages_with_context = await context_manager.build_context_messages(messages, user_id)
         
-        # 注入系统 prompt
-        # system_prompt, updated_messages = build_prompt(messages_with_context)
-        # updated_messages = messages
-        system_prompt, updated_messages = build_prompt(messages)
+        # 注入系统 prompt（基于上下文后的消息）
+        system_prompt, updated_messages = build_prompt(messages_with_context)
 
         # **非流式模式处理：**
         if not stream:
@@ -154,22 +158,38 @@ async def chat_proxy(request: Request):
             # 调用 OpenAI 获取响应，传入上下文
             # 晚绑定，确保 monkeypatch(main.call_openai_chat) 能命中
             full_output = await globals()["call_openai_chat"](updated_messages)
+            # ✅ 将本轮用户输入与 AI 回复写入数据库（恢复持久化）
+            # 确保已建立 DB 连接
+            try:
+                await connect()
+            except Exception as _e:
+                logger.warning(f"db connect before write failed: {_e}")
+            tasks = []
+            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
+                if t_user:
+                    tasks.append(t_user)
+                else:
+                    logger.warning("add_user_message returned None (context manager may be Noop or content empty)")
+            t_assistant = context_manager.add_assistant_response(full_output, user_id)
+            if t_assistant:
+                tasks.append(t_assistant)
+            else:
+                logger.warning("add_assistant_response returned None (context manager may be Noop or content empty)")
 
-            # tasks = []
-            # # **➡️ 新增：把本轮用户输入持久化（只在最后一条确实是用户消息时写库）**
-            # if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-            #     t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
-            #     if t_user: tasks.append(t_user)
-            
-            # # 将AI回复添加到上下文中
-            # t_assistant = context_manager.add_assistant_response(full_output, user_id)
-            # if t_assistant: tasks.append(t_assistant)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            # # ✅ 等待写库完成，避免记忆任务先跑导致读不到新消息
-            # if tasks:
-            #     await asyncio.gather(*tasks, return_exceptions=True)
+            # 诊断：写入后统计一次用户消息数
+            try:
+                database = db()
+                if database is not None:
+                    cnt = await database["messages"].count_documents({"user_id": user_id, "role": "user"})
+                    logger.info(f"[persist] user={user_id} user_msg_count_after_write={cnt}")
+            except Exception as _e:
+                logger.warning(f"post-write count failed: {_e}")
 
-            # await _maybe_schedule_memory(user_id)
+            await _maybe_schedule_memory(user_id)
 
             # 返回生成的回答
             return JSONResponse(content={"message": full_output})
@@ -199,23 +219,37 @@ async def chat_proxy(request: Request):
                     except Exception as e:
                         logger.warning(f"❌ 流式 chunk 解析失败: {e}")
                 
-                # 流式结束后，将完整的AI回复添加到上下文
-                # if collected_response:
-                #     full_response = "".join(collected_response)
-
-                #     tasks = []
-                #     # **➡️ 新增：写入用户消息（仅当最后一条是用户消息）**
-                #     if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
-                #         t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
-                #         if t_user: tasks.append(t_user)
-                    
-                #     t_assistant = context_manager.add_assistant_response(full_response, user_id)
-                #     if t_assistant: tasks.append(t_assistant)
-
-                #     if tasks:
-                #         await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                #     await _maybe_schedule_memory(user_id)
+                # 流式结束后，将完整的AI回复添加到上下文（恢复持久化）
+                if collected_response:
+                    full_response = "".join(collected_response)
+                    # 确保已建立 DB 连接
+                    try:
+                        await connect()
+                    except Exception as _e:
+                        logger.warning(f"db connect before write(stream) failed: {_e}")
+                    tasks = []
+                    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                        t_user = context_manager.add_user_message(messages[-1].get("content", ""), user_id)
+                        if t_user:
+                            tasks.append(t_user)
+                        else:
+                            logger.warning("add_user_message returned None (stream)")
+                    t_assistant = context_manager.add_assistant_response(full_response, user_id)
+                    if t_assistant:
+                        tasks.append(t_assistant)
+                    else:
+                        logger.warning("add_assistant_response returned None (stream)")
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    # 诊断：写入后统计一次用户消息数
+                    try:
+                        database = db()
+                        if database is not None:
+                            cnt = await database["messages"].count_documents({"user_id": user_id, "role": "user"})
+                            logger.info(f"[persist] user={user_id} user_msg_count_after_write(stream)={cnt}")
+                    except Exception as _e:
+                        logger.warning(f"post-write count(stream) failed: {_e}")
+                    await _maybe_schedule_memory(user_id)
 
             return StreamingResponse(token_stream(), media_type="text/event-stream", headers={
                 "Cache-Control": "no-cache",
@@ -225,3 +259,53 @@ async def chat_proxy(request: Request):
     except Exception as e:
         logger.error(f"🔴 错误: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# ---- 诊断端点：查看上下文与环境开关 ----
+@app.get("/debug/context", tags=["infra"])
+async def debug_context(request: Request):
+    try:
+        from core.context_manager import PURE_CONTEXT  # type: ignore
+        from core.context_manager_mongo import DB_WRITE_INLINE as DBWI  # type: ignore
+    except Exception:
+        PURE_CONTEXT = None
+        DBWI = None
+    return {
+        "manager": type(context_manager).__name__,
+        "PURE_CONTEXT": PURE_CONTEXT,
+        "DB_WRITE_INLINE": DBWI,
+        "MEMORY_RUN_INLINE": MEMORY_RUN_INLINE,
+    }
+
+# ------------------ 历史消息读取（最小API） ------------------
+@app.get("/v1/messages", tags=["history"])
+async def get_messages(request: Request, limit: int = 100):
+    """
+    返回当前用户最近的消息（按时间正序，便于直接渲染）。
+    - X-User-Id 或 JWT sub 用作 user_id
+    - limit: 最大条数（默认100）
+    """
+    try:
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
+
+        await connect()
+        database = db()
+        if database is None:
+            return JSONResponse(content={"messages": []})
+
+        cursor = database["messages"].find({"user_id": user_id}).sort("created_at", 1).limit(int(limit))
+        docs = []
+        async for d in cursor:
+            docs.append({
+                "role": d.get("role"),
+                "content": d.get("content"),
+                "created_at": d.get("created_at")
+            })
+        return {"messages": docs}
+    except Exception as e:
+        logger.error(f"history error: {e}")
+        return JSONResponse(content={"messages": [], "error": str(e)}, status_code=500)
