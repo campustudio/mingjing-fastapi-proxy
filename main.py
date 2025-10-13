@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Body
 
 load_dotenv()
 
@@ -15,6 +16,8 @@ from core.context_manager import context_manager
 from core.db_mongo import db, connect
 from core.config import CONTEXT_MAX_TURNS
 from core.memory_manager import SUMMARY_UPDATE_EVERY, get_memory, maybe_update_memory
+from bson import ObjectId
+
 
 import asyncio
 from asyncio import wait_for, TimeoutError as AsyncTimeout
@@ -134,6 +137,7 @@ async def chat_proxy(request: Request):
         # 获取用户ID（这里使用默认用户，实际项目中可以从请求中获取）
         auth_header = request.headers.get("Authorization")
         user_id = request.headers.get("X-User-Id", "default_user")
+        session_id = request.headers.get("X-Session-Id") or None
         if auth_header and auth_header.startswith("Bearer "):
             data = decode_jwt(auth_header.split(" ",1)[1])
             if data and data.get("sub"):
@@ -145,8 +149,8 @@ async def chat_proxy(request: Request):
         except Exception:
             pass
 
-        # 使用上下文管理器构建包含历史上下文的完整消息列表（恢复 DB 上下文）
-        messages_with_context = await context_manager.build_context_messages(messages, user_id)
+        # 使用上下文管理器构建包含历史上下文的完整消息列表（按会话，若提供 session_id）
+        messages_with_context = await context_manager.build_context_messages(messages, user_id, session_id)
         
         # 注入系统 prompt（基于上下文后的消息）
         system_prompt, updated_messages = build_prompt(messages_with_context)
@@ -179,6 +183,81 @@ async def chat_proxy(request: Request):
 
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 额外：将消息写入 messages 集合并附带 session_id（便于会话维度读取）
+            try:
+                database = db()
+                if database is not None:
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                        await database["messages"].insert_one({
+                            "user_id": user_id,
+                            "session_id": session_id,
+                            "role": "user",
+                            "content": messages[-1].get("content", ""),
+                            "created_at": now,
+                        })
+                        # 更新/创建会话摘要
+                        if session_id:
+                            content_preview = messages[-1].get("content", "")
+                            # 优先按 ObjectId 更新；若无法转换，退回字符串 _id，但不 upsert，避免制造重复会话
+                            try:
+                                oid = ObjectId(session_id)
+                                await database["sessions"].update_one(
+                                    {"_id": oid, "user_id": user_id},
+                                    {"$set": {"updated_at": now, "last_message_preview": content_preview[:60]},
+                                     "$inc": {"message_count": 1}},
+                                )
+                            except Exception:
+                                await database["sessions"].update_one(
+                                    {"_id": session_id, "user_id": user_id},
+                                    {"$set": {"updated_at": now, "last_message_preview": content_preview[:60]},
+                                     "$inc": {"message_count": 1}},
+                                )
+                            # 自动标题：仅当当前标题为“未命名会话”时用首条 user 文本前20字命名
+                            auto_title = content_preview.strip().replace("\n", " ")[:20]
+                            if auto_title:
+                                await database["sessions"].update_one(
+                                    {"_id": session_id, "user_id": user_id, "title": "未命名会话"},
+                                    {"$set": {"title": auto_title}},
+                                )
+                                try:
+                                    oid = ObjectId(session_id)
+                                    await database["sessions"].update_one(
+                                        {"_id": oid, "user_id": user_id, "title": "未命名会话"},
+                                        {"$set": {"title": auto_title}},
+                                    )
+                                except Exception:
+                                    pass
+                    # assistant 回复：若客户端已断开（如前端切换会话触发取消），不落库、不计数
+                    try:
+                        disconnected = await request.is_disconnected()
+                    except Exception:
+                        disconnected = False
+                    if not disconnected:
+                        await database["messages"].insert_one({
+                            "user_id": user_id,
+                            "session_id": session_id,
+                            "role": "assistant",
+                            "content": full_output,
+                            "created_at": now,
+                        })
+                        if session_id:
+                            # 同步 updated_at（assistant 回复后）
+                            try:
+                                oid = ObjectId(session_id)
+                                await database["sessions"].update_one(
+                                    {"_id": oid, "user_id": user_id},
+                                    {"$set": {"updated_at": now}, "$inc": {"message_count": 1}},
+                                )
+                            except Exception:
+                                await database["sessions"].update_one(
+                                    {"_id": session_id, "user_id": user_id},
+                                    {"$set": {"updated_at": now}, "$inc": {"message_count": 1}},
+                                )
+            except Exception as werr:
+                logger.warning(f"write messages with session failed: {werr}")
 
             # 诊断：写入后统计一次用户消息数
             try:
@@ -241,6 +320,76 @@ async def chat_proxy(request: Request):
                         logger.warning("add_assistant_response returned None (stream)")
                     if tasks:
                         await asyncio.gather(*tasks, return_exceptions=True)
+                    # 额外：messages 集合写入（带 session_id）
+                    try:
+                        database = db()
+                        if database is not None:
+                            from datetime import datetime, timezone
+                            now = datetime.now(timezone.utc)
+                            if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+                                await database["messages"].insert_one({
+                                    "user_id": user_id,
+                                    "session_id": session_id,
+                                    "role": "user",
+                                    "content": messages[-1].get("content", ""),
+                                    "created_at": now,
+                                })
+                                if session_id:
+                                    content_preview = messages[-1].get("content", "")
+                                    try:
+                                        oid = ObjectId(session_id)
+                                        await database["sessions"].update_one(
+                                            {"_id": oid, "user_id": user_id},
+                                            {"$set": {"updated_at": now, "last_message_preview": content_preview[:60]},
+                                             "$inc": {"message_count": 1}},
+                                        )
+                                    except Exception:
+                                        await database["sessions"].update_one(
+                                            {"_id": session_id, "user_id": user_id},
+                                            {"$set": {"updated_at": now, "last_message_preview": content_preview[:60]},
+                                             "$inc": {"message_count": 1}},
+                                        )
+                                    auto_title = content_preview.strip().replace("\n", " ")[:20]
+                                    if auto_title:
+                                        await database["sessions"].update_one(
+                                            {"_id": session_id, "user_id": user_id, "title": "未命名会话"},
+                                            {"$set": {"title": auto_title}},
+                                        )
+                                        try:
+                                            oid = ObjectId(session_id)
+                                            await database["sessions"].update_one(
+                                                {"_id": oid, "user_id": user_id, "title": "未命名会话"},
+                                                {"$set": {"title": auto_title}},
+                                            )
+                                        except Exception:
+                                            pass
+                            # 若客户端已断开，跳过 assistant 落库与会话计数
+                            try:
+                                disconnected = await request.is_disconnected()
+                            except Exception:
+                                disconnected = False
+                            if not disconnected:
+                                await database["messages"].insert_one({
+                                    "user_id": user_id,
+                                    "session_id": session_id,
+                                    "role": "assistant",
+                                    "content": full_response,
+                                    "created_at": now,
+                                })
+                                if session_id:
+                                    try:
+                                        oid = ObjectId(session_id)
+                                        await database["sessions"].update_one(
+                                            {"_id": oid, "user_id": user_id},
+                                            {"$set": {"updated_at": now}, "$inc": {"message_count": 1}},
+                                        )
+                                    except Exception:
+                                        await database["sessions"].update_one(
+                                            {"_id": session_id, "user_id": user_id},
+                                            {"$set": {"updated_at": now}, "$inc": {"message_count": 1}},
+                                        )
+                    except Exception as werr:
+                        logger.warning(f"write messages with session(stream) failed: {werr}")
                     # 诊断：写入后统计一次用户消息数
                     try:
                         database = db()
@@ -308,4 +457,148 @@ async def get_messages(request: Request, limit: int = 100):
         return {"messages": docs}
     except Exception as e:
         logger.error(f"history error: {e}")
+        return JSONResponse(content={"messages": [], "error": str(e)}, status_code=500)
+
+@app.patch("/v1/sessions/{sid}", tags=["sessions"])
+async def rename_session(request: Request, sid: str, payload: dict = Body(default={})):  # {title}
+    try:
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
+        title = (payload.get("title") or "未命名会话").strip() or "未命名会话"
+        await connect()
+        database = db()
+        if database is None:
+            return JSONResponse(content={"error": "db not connected"}, status_code=500)
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        # 尝试字符串 _id
+        r1 = await database["sessions"].update_one({"_id": sid, "user_id": user_id}, {"$set": {"title": title, "updated_at": now}})
+        # 尝试 ObjectId _id
+        try:
+            oid = ObjectId(sid)
+            r2 = await database["sessions"].update_one({"_id": oid, "user_id": user_id}, {"$set": {"title": title, "updated_at": now}})
+        except Exception:
+            r2 = None
+        if (r1 and r1.matched_count) or (r2 and r2.matched_count):
+            return {"ok": True}
+        return JSONResponse(content={"error": "not found"}, status_code=404)
+    except Exception as e:
+        logger.error(f"rename_session error: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.delete("/v1/sessions/{sid}", tags=["sessions"])
+async def delete_session(request: Request, sid: str):
+    try:
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
+        await connect()
+        database = db()
+        if database is None:
+            return JSONResponse(content={"error": "db not connected"}, status_code=500)
+        # 删除会话文档（尝试字符串与 ObjectId 两种）
+        await database["sessions"].delete_one({"_id": sid, "user_id": user_id})
+        try:
+            oid = ObjectId(sid)
+            await database["sessions"].delete_one({"_id": oid, "user_id": user_id})
+        except Exception:
+            pass
+        # 删除该会话的消息
+        await database["messages"].delete_many({"user_id": user_id, "session_id": sid})
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"delete_session error: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# ------------------ 会话管理 ------------------
+
+@app.get("/v1/sessions", tags=["sessions"])
+async def list_sessions(request: Request):
+    try:
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
+
+        await connect()
+        database = db()
+        if database is None:
+            return {"sessions": []}
+        cursor = database["sessions"].find({"user_id": user_id}).sort("updated_at", -1)
+        res = []
+        async for s in cursor:
+            res.append({
+                "id": str(s.get("_id")),
+                "title": s.get("title", "未命名会话"),
+                "updated_at": s.get("updated_at"),
+                "message_count": s.get("message_count", 0),
+                "last_message_preview": s.get("last_message_preview", ""),
+            })
+        return {"sessions": res}
+    except Exception as e:
+        logger.error(f"list_sessions error: {e}")
+        return JSONResponse(content={"sessions": [], "error": str(e)}, status_code=500)
+
+@app.post("/v1/sessions", tags=["sessions"])
+async def create_session(request: Request, payload: dict = Body(default={})):  # {title?}
+    try:
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
+        title = (payload.get("title") or "未命名会话").strip() or "未命名会话"
+        await connect()
+        database = db()
+        if database is None:
+            return JSONResponse(content={"error": "db not connected"}, status_code=500)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        doc = {
+            "user_id": user_id,
+            "title": title,
+            "created_at": now,
+            "updated_at": now,
+            "message_count": 0,
+            "last_message_preview": "",
+        }
+        res = await database["sessions"].insert_one(doc)
+        return {"id": str(res.inserted_id)}
+    except Exception as e:
+        logger.error(f"create_session error: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.get("/v1/sessions/{sid}/messages", tags=["sessions"])
+async def get_session_messages(request: Request, sid: str, limit: int = 100):
+    try:
+        auth_header = request.headers.get("Authorization")
+        user_id = request.headers.get("X-User-Id", "default_user")
+        if auth_header and auth_header.startswith("Bearer "):
+            data = decode_jwt(auth_header.split(" ",1)[1])
+            if data and data.get("sub"):
+                user_id = data["sub"]
+        await connect()
+        database = db()
+        if database is None:
+            return {"messages": []}
+        cursor = database["messages"].find({"user_id": user_id, "session_id": sid}).sort("created_at", 1).limit(int(limit))
+        docs = []
+        async for d in cursor:
+            docs.append({
+                "role": d.get("role"),
+                "content": d.get("content"),
+                "created_at": d.get("created_at")
+            })
+        return {"messages": docs}
+    except Exception as e:
+        logger.error(f"get_session_messages error: {e}")
         return JSONResponse(content={"messages": [], "error": str(e)}, status_code=500)

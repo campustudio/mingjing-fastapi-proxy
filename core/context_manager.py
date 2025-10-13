@@ -14,7 +14,7 @@ if PURE_CONTEXT:
         def __init__(self, max_context_length: int = 10):
             self.max_context_length = max_context_length
 
-        async def build_context_messages(self, new_messages: List[Dict[str, Any]], user_id: str = "default_user") -> List[Dict[str, Any]]:
+        async def build_context_messages(self, new_messages: List[Dict[str, Any]], user_id: str = "default_user", session_id: str | None = None) -> List[Dict[str, Any]]:
             # 仅返回本次请求的最后一条 user（如无则空），不附带历史
             if new_messages and isinstance(new_messages[-1], dict):
                 maybe = new_messages[-1]

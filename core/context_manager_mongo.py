@@ -28,7 +28,7 @@ class MongoContextManager:
     async def _ensure(self):
         await connect()
 
-    async def build_context_messages(self, new_messages: List[Dict[str, Any]], user_id: str = "default_user") -> List[Dict[str, Any]]:
+    async def build_context_messages(self, new_messages: List[Dict[str, Any]], user_id: str = "default_user", session_id: str | None = None) -> List[Dict[str, Any]]:
         await self._ensure()
         database = db()
         if database is None:
@@ -39,26 +39,25 @@ class MongoContextManager:
                     return [{"role": "user", "content": nm["content"]}]
             return []
 
-        # 1) 长时记忆前缀（0-2 条 assistant）
         mem = await get_memory(database, user_id)
         preamble = build_memory_preamble(mem)
 
         # 2) 拉历史记录（升序）
         coll = database["messages"]
-        cursor = coll.find({"user_id": user_id}).sort("created_at", 1)
-        history = [{"role": d.get("role","user"), "content": d.get("content","")} async for d in cursor]
-
+        q = {"user_id": user_id}
+        if session_id:
+            q["session_id"] = session_id
+        cursor = coll.find(q).sort("created_at", 1)
+        history = [{"role": d.get("role","user"), "content": d.get("content","" )} async for d in cursor]
         # 仅保留 (N-1) 个 turn => 2*(N-1) 条历史
         keep_hist = 2 * max(self.max_context_length - 1, 0)
         history = history[-keep_hist:] if keep_hist > 0 else []
 
-        # 3) 只取本次请求里的“最后一条 user”
         last_user = None
         if new_messages and isinstance(new_messages[-1], dict):
             nm = new_messages[-1]
             if nm.get("role") == "user" and nm.get("content"):
                 last_user = {"role": "user", "content": nm["content"]}
-
         # 4) 合并顺序：preamble + history + last_user
         merged: List[Dict[str, Any]] = []
         merged.extend(preamble)
