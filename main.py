@@ -1,8 +1,8 @@
-# main.py
+ 
 import logging
 import json
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi import Body
@@ -10,12 +10,13 @@ from fastapi import Body
 load_dotenv()
 
 from core import client as openai_client
+from core.client import OPENAI_API_KEY
 from core.prompt_builder import build_prompt
 from core.auth_utils import decode_jwt
 from core.context_manager import context_manager
 from core.db_mongo import db, connect
 from core.config import CONTEXT_MAX_TURNS
-from core.memory_manager import SUMMARY_UPDATE_EVERY, get_memory, maybe_update_memory
+from core.memory_manager import SUMMARY_UPDATE_EVERY, maybe_update_memory
 from bson import ObjectId
 
 
@@ -23,9 +24,17 @@ import asyncio
 from asyncio import wait_for, TimeoutError as AsyncTimeout
 from auth_routes import router as auth_router
 import os
+import tempfile
+import subprocess
+import shutil
 
-# --- main.py 顶部其它 import 之后，加这一行 ---
+# --- main.py 顶部其它 import 之后，加这些环境开关 ---
 MEMORY_RUN_INLINE = os.getenv("MEMORY_RUN_INLINE", "false").lower() in ("1", "true", "yes", "y")
+# 语音增强：在 Vercel 上建议设为 false（仅转发到 Whisper）；
+# 在容器/本地可设为 true（启用 ffmpeg 转码 + VAD 静音切分）
+AUDIO_ENHANCE = os.getenv("AUDIO_ENHANCE", "false").lower() in ("1", "true", "yes", "y")
+# 可选：指定 ffmpeg 静态二进制路径；若未设则自动 which("ffmpeg")
+FFMPEG_PATH = os.getenv("FFMPEG_PATH")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +49,163 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---- Speech-to-Text: Whisper proxy ----
+@app.post("/v1/audio/transcriptions", tags=["stt"])
+async def transcribe_audio(file: UploadFile = File(...)):
+    try:
+        import httpx
+        if not OPENAI_API_KEY:
+            return JSONResponse(content={"error": "OPENAI_API_KEY not configured"}, status_code=500)
+
+        # 读取上传内容并做体积保护（例如 15MB 上限）
+        raw = await file.read()
+        if raw is None:
+            return JSONResponse(content={"error": "empty file"}, status_code=400)
+        max_bytes = 15 * 1024 * 1024
+        if len(raw) > max_bytes:
+            return JSONResponse(
+                content={"error": "音频文件过大，超出服务限制，请缩短后重试 (413)"},
+                status_code=413,
+            )
+
+        # 若 AUDIO_ENHANCE=false，跳过 ffmpeg/VAD，直接把原始音频转给 Whisper
+        # 若 AUDIO_ENHANCE=true，优先尝试用 ffmpeg 转码为 16kHz/单声道 WAV，并做轻度滤波/响度归一
+        ffmpeg_bin = FFMPEG_PATH or shutil.which("ffmpeg")
+        use_ffmpeg = bool(AUDIO_ENHANCE and ffmpeg_bin)
+        out_bytes = None
+        out_name = None
+        out_mime = None
+        if use_ffmpeg:
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".webm", delete=True) as tmp_in:
+                    tmp_in.write(raw)
+                    tmp_in.flush()
+                    # 转码到内存（通过管道输出 WAV）
+                    cmd = [
+                        ffmpeg_bin, "-y", "-i", tmp_in.name,
+                        "-ac", "1", "-ar", "16000",
+                        # 轻度高通+低通+响度归一（温和配置）
+                        "-af", "highpass=f=100,lowpass=f=7000,loudnorm=I=-23:TP=-1.0:LRA=7",
+                        "-f", "wav", "pipe:1",
+                    ]
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if proc.returncode == 0 and proc.stdout:
+                        out_bytes = proc.stdout
+                        out_name = "audio.wav"
+                        out_mime = "audio/wav"
+                    else:
+                        logger.warning(f"ffmpeg failed, stderr={proc.stderr[:300]!r}")
+            except Exception as fe:
+                logger.warning(f"ffmpeg transcode error: {fe}")
+
+        # 若 ffmpeg 不可用或转码失败，则回退到原始 webm
+        if out_bytes is None:
+            out_bytes = raw
+            out_name = file.filename or "speech.webm"
+            out_mime = file.content_type or "audio/webm"
+
+        segments = [out_bytes]
+        if AUDIO_ENHANCE:
+            # 可选：VAD 静音切分（依赖 webrtcvad，如不可用则整段转写）
+            try:
+                import io
+                import wave
+                import webrtcvad
+                vad = webrtcvad.Vad(2)  # 0-3，2较平衡
+                # 从 WAV 读取原始 PCM（16k/单声道/16bit）
+                with io.BytesIO(out_bytes) as bio:
+                    with wave.open(bio, 'rb') as w:
+                        ch = w.getnchannels()
+                        sr = w.getframerate()
+                        sw = w.getsampwidth()
+                        pcm = w.readframes(w.getnframes())
+                if sr == 16000 and ch == 1 and sw == 2:
+                    frame_dur_ms = 20
+                    bytes_per_frame = int(sr * (frame_dur_ms/1000.0)) * 2  # 16-bit mono
+                    frames = [pcm[i:i+bytes_per_frame] for i in range(0, len(pcm), bytes_per_frame)]
+                    def is_speech(frame):
+                        if len(frame) < bytes_per_frame:
+                            return False
+                        try:
+                            return vad.is_speech(frame, sr)
+                        except Exception:
+                            return False
+                    # 聚合为片段（简单状态机，带少量缓冲）
+                    speech_chunks = []
+                    cur = bytearray()
+                    silence_count = 0
+                    max_silence_frames = int(300 / frame_dur_ms)  # 约300ms的尾随静音作为边界
+                    max_segment_frames = int(45000 / frame_dur_ms)  # 单段最长约45s，防止过长
+                    cnt_frames = 0
+                    for fr in frames:
+                        cnt_frames += 1
+                        if is_speech(fr):
+                            cur.extend(fr)
+                            silence_count = 0
+                        else:
+                            if len(cur) > 0:
+                                silence_count += 1
+                                cur.extend(fr)
+                                if silence_count >= max_silence_frames or cnt_frames >= max_segment_frames:
+                                    speech_chunks.append(bytes(cur))
+                                    cur = bytearray()
+                                    silence_count = 0
+                                    cnt_frames = 0
+                    if len(cur) > 0:
+                        speech_chunks.append(bytes(cur))
+
+                    # 将每个语音片段重新封装为独立 WAV
+                    def pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
+                        import io
+                        import wave
+                        bio = io.BytesIO()
+                        with wave.open(bio, 'wb') as w:
+                            w.setnchannels(1)
+                            w.setsampwidth(2)
+                            w.setframerate(sample_rate)
+                            w.writeframes(pcm_bytes)
+                        return bio.getvalue()
+
+                    new_segments = []
+                    for chunk in speech_chunks:
+                        # 过滤掉极短片段（< 400ms）
+                        if len(chunk) < int(0.4 * sr) * 2:
+                            continue
+                        new_segments.append(pcm_to_wav_bytes(chunk, sr))
+                    if new_segments:
+                        segments = new_segments
+            except Exception as _vad_e:
+                # 缺少 webrtcvad 或处理失败，维持整段送出
+                pass
+
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        url = "https://api.openai.com/v1/audio/transcriptions"
+        final_texts = []
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for idx, seg in enumerate(segments):
+                data = {
+                    "model": "whisper-1",
+                    "language": "zh",
+                }
+                files = {
+                    "file": (f"seg_{idx}.wav", seg, "audio/wav"),
+                }
+                res = await client.post(url, headers=headers, data=data, files=files)
+                if res.status_code >= 400:
+                    try:
+                        err = res.json()
+                    except Exception:
+                        err = {"status": res.status_code, "text": res.text}
+                    return JSONResponse(content={"error": err}, status_code=res.status_code)
+                j = res.json()
+                txt = j.get("text", "").strip()
+                if txt:
+                    final_texts.append(txt)
+        return {"text": " ".join(final_texts).strip()}
+    except Exception as e:
+        logger.error(f"/v1/audio/transcriptions error: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # ---- Health check (pre-warm DB & create indexes) ----
 @app.get("/health", tags=["infra"])

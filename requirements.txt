@@ -10,3 +10,4 @@ pymongo
 starlette
 dnspython
 python-docx
+python-multipart
