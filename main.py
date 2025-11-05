@@ -6,6 +6,9 @@ from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi import Body
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
@@ -40,6 +43,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# 初始化速率限制器
+# 在 Serverless 环境下，slowapi 的内存存储可能失效（每个请求在不同容器）
+# 可通过环境变量 ENABLE_RATE_LIMIT=false 禁用
+ENABLE_RATE_LIMIT = os.getenv("ENABLE_RATE_LIMIT", "true").lower() in ("1", "true", "yes", "y")
+
+if ENABLE_RATE_LIMIT:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    logger.info("✅ 速率限制已启用")
+else:
+    # 创建一个空的 limiter 对象，避免装饰器报错
+    from unittest.mock import MagicMock
+    limiter = MagicMock()
+    limiter.limit = lambda x: lambda f: f  # 返回原函数，不做限流
+    logger.warning("⚠️  速率限制已禁用（ENABLE_RATE_LIMIT=false）")
+
 app.include_router(auth_router)
 # 正确注册 CORS
 app.add_middleware(
@@ -52,7 +73,8 @@ app.add_middleware(
 
 # ---- Speech-to-Text: Whisper proxy ----
 @app.post("/v1/audio/transcriptions", tags=["stt"])
-async def transcribe_audio(file: UploadFile = File(...)):
+@limiter.limit("10/minute")  # 每分钟最多10次语音转写
+async def transcribe_audio(request: Request, file: UploadFile = File(...)):
     try:
         import httpx
         if not OPENAI_API_KEY:
@@ -294,6 +316,7 @@ async def _maybe_schedule_memory(user_id: str):
 
 # ------------------ 核心接口：聊天代理 ------------------
 @app.post("/v1/chat/completions")
+@limiter.limit("30/minute")  # 每分钟最多30次对话请求
 async def chat_proxy(request: Request):
     try:
         data = await request.json()

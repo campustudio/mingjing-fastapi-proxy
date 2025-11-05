@@ -11,3 +11,4 @@ starlette
 dnspython
 python-docx
 python-multipart
+slowapi
