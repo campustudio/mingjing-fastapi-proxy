@@ -9,6 +9,8 @@ from fastapi import Body
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+import io
+from docx import Document
 
 load_dotenv()
 
@@ -227,6 +229,47 @@ async def transcribe_audio(request: Request, file: UploadFile = File(...)):
         return {"text": " ".join(final_texts).strip()}
     except Exception as e:
         logger.error(f"/v1/audio/transcriptions error: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# ---- File extract: DOCX ----
+@app.post("/v1/files/extract-docx", tags=["files"])
+@limiter.limit("20/minute")
+async def extract_docx(request: Request, file: UploadFile = File(...)):
+    try:
+        if not file:
+            return JSONResponse(content={"error": "no file"}, status_code=400)
+        filename = file.filename or ""
+        ctype = (file.content_type or "").lower()
+        if not (filename.lower().endswith(".docx") or ctype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+            return JSONResponse(content={"error": "DOCX_ONLY"}, status_code=400)
+        raw = await file.read()
+        if raw is None:
+            return JSONResponse(content={"error": "empty file"}, status_code=400)
+        # DEMO 限制：<= 1MB
+        if len(raw) > 1 * 1024 * 1024:
+            return JSONResponse(content={"error": "DOCX_TOO_LARGE"}, status_code=413)
+        # 解析 DOCX 文本
+        bio = io.BytesIO(raw)
+        doc = Document(bio)
+        texts = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                texts.append(t)
+        # 可选：表格内容（简单加入）
+        for tbl in getattr(doc, "tables", []) or []:
+            for row in tbl.rows:
+                row_text = []
+                for cell in row.cells:
+                    ct = (cell.text or "").strip()
+                    if ct:
+                        row_text.append(ct)
+                if row_text:
+                    texts.append(" \t ".join(row_text))
+        full = "\n".join(texts).strip()
+        return {"text": full}
+    except Exception as e:
+        logger.error(f"/v1/files/extract-docx error: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # ---- Health check (pre-warm DB & create indexes) ----

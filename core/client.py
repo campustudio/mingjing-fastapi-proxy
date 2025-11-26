@@ -2,16 +2,21 @@
 
 import os
 import httpx
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+OPENAI_ENDPOINT = f"{OPENAI_API_BASE}/chat/completions"
 
 HEADERS = {
     "Authorization": f"Bearer {OPENAI_API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Connection": "close",
+    "User-Agent": "MingjingProxy/1.0"
 }
 
 # 请求 payload 构造（共用）
@@ -36,10 +41,36 @@ async def call_openai_chat(updated_messages):
     print("🧠 注入后 payload:", payload)
 
     # 调用 OpenAI API 获取响应
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        res = await client.post(OPENAI_ENDPOINT, headers=HEADERS, json=payload)
-        res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"]
+    timeout = httpx.Timeout(40.0)
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=0, keepalive_expiry=0)
+    async with httpx.AsyncClient(timeout=timeout, http2=False, limits=limits, headers=HEADERS, trust_env=False) as client:
+        for attempt in range(3):
+            try:
+                res = await client.post(OPENAI_ENDPOINT, json=payload)
+                res.raise_for_status()
+                return res.json()["choices"][0]["message"]["content"]
+            except (httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadError, httpx.ConnectError):
+                if attempt < 2:
+                    await asyncio.sleep(0.2 * (2 ** attempt))
+                    continue
+                break
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status in (502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(0.2 * (2 ** attempt))
+                    continue
+                raise
+
+    def _sync_call():
+        try:
+            import requests as _req
+        except Exception as _e:
+            raise RuntimeError("requests not available for fallback") from _e
+        r = _req.post(OPENAI_ENDPOINT, headers=HEADERS, json=payload, timeout=40)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    return await asyncio.to_thread(_sync_call)
 
 # ✅ 流式调用（用于 stream_response 场景）
 async def call_openai_chat_stream(updated_messages):
@@ -47,8 +78,10 @@ async def call_openai_chat_stream(updated_messages):
     合并系统 prompt 和上下文，并流式获取 OpenAI 响应
     """
     payload = build_payload(updated_messages, stream=True)
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", OPENAI_ENDPOINT, headers=HEADERS, json=payload) as response:
+    timeout = httpx.Timeout(None)
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=0, keepalive_expiry=0)
+    async with httpx.AsyncClient(timeout=timeout, http2=False, limits=limits, headers=HEADERS, trust_env=False) as client:
+        async with client.stream("POST", OPENAI_ENDPOINT, json=payload) as response:
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     content = line[len("data: "):].strip()
