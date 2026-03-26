@@ -95,15 +95,18 @@ async def wechat_login(code: str = Query(..., description="微信授权回调的
     existing = await users.find_one({"wx_openid": wx_user.openid})
     
     if existing:
-        # 更新用户信息
+        # 更新用户信息，增加登录次数
         await users.update_one(
             {"_id": existing["_id"]},
-            {"$set": {
-                "wx_nickname": wx_user.nickname,
-                "wx_avatar_url": wx_user.headimgurl,
-                "wx_last_auth_at": now,
-                "last_login_at": now,
-            }}
+            {
+                "$set": {
+                    "wx_nickname": wx_user.nickname,
+                    "wx_avatar_url": wx_user.headimgurl,
+                    "wx_last_auth_at": now,
+                    "last_login_at": now,
+                },
+                "$inc": {"login_count": 1}
+            }
         )
         user_id = str(existing["_id"])
         # 计算同行天数，处理时区问题
@@ -128,6 +131,7 @@ async def wechat_login(code: str = Query(..., description="微信授权回调的
             "wx_last_auth_at": now,
             "created_at": now,
             "last_login_at": now,
+            "login_count": 1,
             "auth_method": "wechat",
         })
         user_id = str(res.inserted_id)
