@@ -272,6 +272,64 @@ async def extract_docx(request: Request, file: UploadFile = File(...)):
         logger.error(f"/v1/files/extract-docx error: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
+# ---- 用户信息接口 ----
+@app.get("/v1/user/profile", tags=["user"])
+async def get_user_profile(request: Request):
+    """
+    获取当前登录用户的信息
+    需要在 Header 中携带 Authorization: Bearer <token>
+    """
+    from datetime import datetime, timezone
+    
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(content={"error": "未授权"}, status_code=401)
+    
+    token = auth_header.split(" ", 1)[1]
+    payload = decode_jwt(token)
+    if not payload:
+        return JSONResponse(content={"error": "无效的令牌"}, status_code=401)
+    
+    user_id = payload.get("sub")
+    if not user_id:
+        return JSONResponse(content={"error": "无效的用户"}, status_code=401)
+    
+    await connect()
+    database = db()
+    if database is None:
+        return JSONResponse(content={"error": "数据库未连接"}, status_code=500)
+    
+    users = database["users"]
+    
+    # 根据 user_id 格式判断查询方式
+    if user_id.startswith("u:"):
+        # 纯净模式的临时用户
+        return {
+            "openid": "",
+            "nickname": payload.get("username", "用户"),
+            "avatar": "",
+            "days": 1,
+        }
+    
+    try:
+        user = await users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        return JSONResponse(content={"error": "用户不存在"}, status_code=404)
+    
+    if not user:
+        return JSONResponse(content={"error": "用户不存在"}, status_code=404)
+    
+    now = datetime.now(timezone.utc)
+    days = (now - user.get("created_at", now)).days + 1
+    
+    return {
+        "openid": user.get("wx_openid", ""),
+        "nickname": user.get("wx_nickname") or user.get("username", "用户"),
+        "avatar": user.get("wx_avatar_url", ""),
+        "days": days,
+    }
+
+
 # ---- Health check (pre-warm DB & create indexes) ----
 @app.get("/health", tags=["infra"])
 async def health():
