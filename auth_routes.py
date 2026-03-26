@@ -106,7 +106,15 @@ async def wechat_login(code: str = Query(..., description="微信授权回调的
             }}
         )
         user_id = str(existing["_id"])
-        days = (now - existing.get("created_at", now)).days + 1
+        # 计算同行天数，处理时区问题
+        created_at = existing.get("created_at")
+        if created_at:
+            # 如果 created_at 没有时区信息，添加 UTC 时区
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            days = (now - created_at).days + 1
+        else:
+            days = 1
     else:
         # 创建新用户
         res = await users.insert_one({
