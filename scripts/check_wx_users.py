@@ -16,7 +16,8 @@ async def check_users():
         return
     
     client = AsyncIOMotorClient(mongo_uri)
-    db = client.get_default_database()
+    # 直接使用 mingjing 数据库
+    db = client.mingjing
     users = db.users
     
     print("=" * 50)
